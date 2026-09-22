@@ -1103,23 +1103,23 @@ HTML = r"""
     <div class="card">
       <div class="top"></div>
       <div class="inner">
-        <h2>SST01 TRANSCEIVER <span class="pill" id="sstpill" style="margin-left:8px"><span id="sstdot" class="dot off"></span><span id="sststate">connecting</span></span></h2>
-        <div class="ct">Directs the Nucleo-driven SST01 UHF radio: RX (receive + print packet over serial) or TX (send text).</div>
+        <h2>Si443x TRANSCEIVER <span class="pill" id="sstpill" style="margin-left:8px"><span id="sstdot" class="dot off"></span><span id="sststate">connecting</span></span></h2>
+        <div class="ct">Directs the Nucleo-driven Si443x-class UHF radio: RX (receive + print packet over serial) or TX (send text).</div>
         <div class="dev"><span class="lbl">Radio</span><span class="val" id="sstport">/dev/ttyACM0</span></div>
         <div class="row" style="margin-top:14px">
           <button class="btn-green" onclick="sstMode('rx')">RX</button>
           <button class="btn-gold" onclick="sstMode('idle')">Idle</button>
         </div>
         <div style="margin-top:12px">
-          <label>Send text on SST01 (TX)</label>
+          <label>Send text on the Si443x (TX)</label>
           <input id="sstmsg" type="text" value="HELLO FROM GALAMAD" spellcheck="false">
         </div>
         <div class="row">
           <button class="btn-gold" onclick="sstSend()">Send Text</button>
         </div>
-        <div id="sstsgo" class="msg">SST01 idle — press RX to receive, or enter text + Send.</div>
+        <div id="sstsgo" class="msg">Si443x idle — press RX to receive, or enter text + Send.</div>
         <div class="sig" style="margin-top:12px">
-          <div class="label">SST01 RX / status</div>
+          <div class="label">Si443x RX / status</div>
           <pre id="sstlog" style="white-space:pre-wrap;font-size:11px;color:var(--mut);margin:0;max-height:150px;overflow:auto">(no data yet)</pre>
         </div>
       </div>
@@ -1275,11 +1275,11 @@ async function refreshSst(){
     if(pill) pill.classList.toggle('act', s.present && label!=='connected' && label!=='idle');
     if((s.rx_msgs&&s.rx_msgs.length)||(s.tx_msgs&&s.tx_msgs.length)){
       const log=[];
-      (s.tx_msgs||[]).forEach(l=>log.push('SST TX: '+l));
-      (s.rx_msgs||[]).forEach(l=>log.push('SST RX: '+l));
+      (s.tx_msgs||[]).forEach(l=>log.push('Si443x TX: '+l));
+      (s.rx_msgs||[]).forEach(l=>log.push('Si443x RX: '+l));
       document.getElementById('sstlog').textContent=log.join('\n')+'\n'+(s.last_state?'—— '+s.last_state:'');
     }else{
-      document.getElementById('sstlog').textContent=s.last_state||(s.present?'SST01 connected':'SST01 not connected');
+      document.getElementById('sstlog').textContent=s.last_state||(s.present?'Si443x connected':'Si443x not connected');
     }
     if(s.auto===true && go && go.textContent.indexOf('autonomous')<0 && go.className!=='msg ok' && go.className!=='msg err'){
       go.textContent=(label==='AUTO RX/TX')
@@ -1290,18 +1290,18 @@ async function refreshSst(){
 }
 async function sstMode(mode){
   const out=document.getElementById('sstsgo'); out.className='msg';
-  out.textContent=mode==='rx'?'Switching SST01 to RX (receive packets)…':(mode==='tx'?'Switching SST01 to TX…':'Switching SST01 to idle…');
+  out.textContent=mode==='rx'?'Switching Si443x to RX (receive packets)…':(mode==='tx'?'Switching Si443x to TX…':'Switching Si443x to idle…');
   const r=await jpost('/sst01/mode',{mode});
-  if(r.ok){ out.className='msg ok'; out.textContent='SST01 now '+(r.mode||mode)+': '+(r.resp||''); }
+  if(r.ok){ out.className='msg ok'; out.textContent='Si443x now '+(r.mode||mode)+': '+(r.resp||''); }
   else{ out.className='msg err'; out.textContent=r.error||'error'; }
   refreshSst();
 }
 async function sstSend(){
   const t=document.getElementById('sstmsg').value.trim();
   const out=document.getElementById('sstsgo'); out.className='msg';
-  out.textContent='SST01 TX: '+t+'…';
+  out.textContent='Si443x TX: '+t+'…';
   const r=await jpost('/sst01/send',{text:t});
-  if(r.ok){ out.className='msg ok'; out.textContent='Sent on SST01: '+r.text+' ('+(r.resp||'ok')+')'; }
+  if(r.ok){ out.className='msg ok'; out.textContent='Sent on the Si443x: '+r.text+' ('+(r.resp||'ok')+')'; }
   else{ out.className='msg err'; out.textContent=r.error||'error'; }
   refreshSst();
 }
