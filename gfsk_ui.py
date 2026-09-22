@@ -97,7 +97,7 @@ _sel = {"rx_kind": "rtl", "rx_index": 0, "hackrf_serial": None,
 _tx_cfg = {"tx_gain": config.TX_ATTENUATION,
            "amp": bool(config.TX_AMPLIFIER)}             # HackRF TX power/amp
 
-# ---- SST01 / Nucleo serial control ----
+# ---- Si443x / Nucleo serial control ----
 _SST01_PORT = os.environ.get("SST01_PORT", "/dev/ttyACM0")
 _SST01_BAUD = 115200
 _ACTIVITY_AGE = 8.0            # how long a firmware-reported tx/rx stays "current"
@@ -435,7 +435,7 @@ def _capture(path, seconds):
 def decode_capture(path: str) -> list:
     # Prefer strict CRC-valid packets. Try the exact payload length the app
     # is currently transmitting first (fast, correct for the self-loop), then
-    # the legacy 7-byte SST01 format. NEVER scan all 32 lengths (AGENTS §21):
+    # the legacy 7-byte Si443x-class beacon format. NEVER scan all 32 lengths:
     # that turns a ~3s decode into minutes. On a noisy bench the wideband CRC
     # flips ~1 bit/packet, so fall back to majority-vote of the repeated
     # beacon payloads, capped to a single length.
@@ -790,7 +790,7 @@ def spectrum():
         _cap_lock.release()
 
 
-# ---- SST01 mode control ----
+# ---- Si443x mode control ----
 def _sst_enter(mode):
     """Enter a mode: 'rx', 'tx', 'idle'. Returns status text."""
     if _sst["serial"] is not None or _sst_open():
@@ -1263,7 +1263,7 @@ async function checkSignal(){
 function escapeHtml(s){return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 refreshStatus();setInterval(refreshStatus,2000);
 
-// ---- SST01 mode control ----
+// ---- Si443x mode control ----
 async function refreshSst(){
   try{
     const s=await (await fetch('/sst01/status')).json();
