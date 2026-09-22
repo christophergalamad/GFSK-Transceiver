@@ -1,0 +1,5 @@
+# Python deps for the GALAMAD UHF GFSK Transceiver
+flask
+waitress
+numpy
+scipy

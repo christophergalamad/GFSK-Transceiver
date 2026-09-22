@@ -1,0 +1,12 @@
+# SDR runtime artifacts
+*.iq
+*.bin
+*.wav
+data/
+logs/
+ui.log
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.DS_Store
