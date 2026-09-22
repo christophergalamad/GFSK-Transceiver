@@ -27,8 +27,8 @@ a simple, cheap lab radio link (HackRF ↔ HackRF loopback).
 - **Receive**: captures IQ from a HackRF (or RTL-SDR), finds bursts, locks the
   carrier per burst, demodulates GFSK and returns the decoded text with CRC
   validation and signal metrics.
-- **SST01 card** (optional): reads live state from a serial-connected
-  SST01/Nucleo beacon so one page shows the whole link.
+- **Beacon card** (optional): reads live state from a serial-connected
+  Si443x-class/Nucleo beacon so one page shows the whole link.
 
 The packet format on air is:
 
@@ -212,20 +212,20 @@ python3 decode_sst01.py cap.iq --fs 1200000 --payload-len 25   # longer message
 
 ---
 
-## 9. Hardware: SST01 / Nucleo beacon (optional)
+## 9. Hardware: Si443x-class / Nucleo beacon (optional)
 
-The repo ships an optional companion transmitter: an **EXA SST01** (Si443x
-class) driven from an STM32 **Nucleo G474RE** by bit-banged SPI at 434 MHz.
-Firmware sketches live in `nucleo_firmware/` (`sst01_test`, `sst_fixlen`,
-`sst_rx_tx`). Its on-air packet is the same fixed-length format the decoder
-reads — 7 payload bytes, sync `0x2DD4`, CRC-16 CCITT — so the app decodes the
-beacon as easily as a HackRF packet.
+The repo ships an optional companion transmitter: a **Si443x-class** radio
+driven from an STM32 **Nucleo G474RE** by bit-banged SPI at 434 MHz. Firmware
+sketches live in `nucleo_firmware/` (sst01_test, sst_fixlen, sst_rx_tx). Its
+on-air packet is the same fixed-length format the decoder reads — 7 payload
+bytes, sync `0x2DD4`, CRC-16 CCITT — so the app decodes the beacon as easily
+as a HackRF packet.
 
 The bench wiring and bring-up runbook are detailed **inside the repo's
 `AGENTS.md`** (wiring table, register state, do-not-do list). A quick checklist
 if you build one:
 
-- Power the SST01 at **3.3 V** (never 5 V).
+- Power the radio at **3.3 V** (never 5 V).
 - Both SDN pins tied together and held low to leave shutdown.
 - bit-bang SPI Mode 0 at ≤ 1 MHz SCLK (proven at 10 kHz and at 1 MHz).
 - RXON/TXON both high during register access.
@@ -274,7 +274,7 @@ Used by the UI; handy for scripts.
 | `POST /decode` | decode the last capture |
 | `POST /signal` | signal metrics for the last capture |
 | `GET /spectrum` | raw FFT power array |
-| `GET/` `POST /sst01/…` | optional SST01/Nucleo card state + commands |
+| `GET/` `POST /sst01/…` | optional Si443x-class/Nucleo card state + commands |
 
 ---
 
@@ -289,7 +289,7 @@ GFSK-Transceiver/
 ├── config.py             RF params: rates, presets, gains, device mapping
 ├── requirements.txt
 ├── start.sh / stop.sh    setsid start + pkill stop (also stops the SDR child)
-├── nucleo_firmware/      optional SST01/Nucleo sketches (.ino)
+├── nucleo_firmware/      optional Si443x-class/Nucleo sketches (.ino)
 └── tests/
     └── test_roundtrip.py offline modulator→demodulator regression test
 ```

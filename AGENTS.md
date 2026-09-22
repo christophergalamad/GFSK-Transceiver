@@ -17,7 +17,7 @@ generate_gfsk_iq.py   GFSK modulator   -> int8 IQ file
 decode_sst01.py       IQ file          -> decoded packets (burst + CRC)
 decode_gfsk.py        legacy demodulator (superseded by decode_sst01.py)
 config.py             RF parameters, presets, gain ceilings
-nucleo_firmware/      optional SST01/Nucleo transmitter sketches (.ino)
+nucleo_firmware/      optional Si443x-class/Nucleo transmitter sketches (.ino)
 tests/                offline regression tests
 ```
 
@@ -70,13 +70,13 @@ demodulator, CRC, or packet framing. It is the acceptance gate for the DSP.
    so start moderate (LNA 24 / VGA 48) and lower gain for strong/adjacent
    transmitters.
 
-## Hardware (SST01 / Nucleo beacon — optional)
+## Hardware (Si443x-class / Nucleo beacon — optional)
 
-The companion transmitter is an EXA SST01 (Si443x class) driven from an STM32
+The companion transmitter is a Si443x-class radio driven from an STM32
 Nucleo by bit-banged SPI, 434 MHz, fixed-length 7-byte frames (same format as
 above). Firmware lives in `nucleo_firmware/`.
 
-- Power the SST01 at **3.3 V**, never 5 V.
+- Power the radio at **3.3 V**, never 5 V.
 - Both SDN pins must be tied together and held low (active-high shutdown).
 - Bit-bang SPI Mode 0 (CPOL=0, CPHA=0) at =< 1 MHz SCLK.
 - Keep TXON and RXON both high during register access; drive the correct
