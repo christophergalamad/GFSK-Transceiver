@@ -93,7 +93,8 @@ _cap_proc = {"proc": None}        # current RX subprocess (for preemption)
 _rtl_cache = []                   # last-known RTL-SDR index list
 _tx = {"proc": None, "msg": None}
 _sel = {"rx_kind": "rtl", "rx_index": 0, "hackrf_serial": None,
-        "hackrf_rx_serial": None, "rx_lna": 24, "rx_vga": 48}
+        "hackrf_rx_serial": None, "rx_lna": 24, "rx_vga": 48,
+        "rtl_gain": 0}            # RTL-SDR gain dB (0 = auto)
 _tx_cfg = {"tx_gain": config.TX_ATTENUATION,
            "amp": bool(config.TX_AMPLIFIER)}             # HackRF TX power/amp
 
@@ -303,7 +304,8 @@ def _rx_cmd(outfile: str, nsamples: int):
     cmd = ["rtl_sdr"]
     if int(_sel["rx_index"]) >= 0:
         cmd += ["-d", str(int(_sel["rx_index"]))]
-    cmd += ["-f", str(tune), "-s", str(_rx_rate()), "-g", str(config.RX_GAIN),
+    cmd += ["-f", str(tune), "-s", str(_rx_rate()),
+            "-g", str(int(_sel.get("rtl_gain", 0))),
             "-n", str(nsamples), outfile]
     return cmd
 
@@ -432,6 +434,11 @@ def _capture(path, seconds):
     return path
 
 
+def _rx_signed():
+    """HackRF captures are signed int8; RTL-SDR captures are unsigned 8-bit."""
+    return _sel.get("rx_kind") != "rtl"
+
+
 def decode_capture(path: str) -> list:
     # Prefer strict CRC-valid packets. Try the exact payload length the app
     # is currently transmitting first (fast, correct for the self-loop), then
@@ -448,7 +455,8 @@ def decode_capture(path: str) -> list:
     for pl in dict.fromkeys(lens):
         if 1 <= pl <= dec.MAX_PAYLOAD_LEN:
             try:
-                packets = dec.decode(path, _rx_rate(), payload_len=pl)
+                packets = dec.decode(path, _rx_rate(), payload_len=pl,
+                                     signed=_rx_signed())
             except Exception:
                 packets = []
             if packets:
@@ -482,7 +490,7 @@ def _decode_json():
     try:
         packets = decode_capture(RX_FILE)
         p = _preset()
-        iq = dec.read_iq(RX_FILE)
+        iq = dec.read_iq(RX_FILE, signed=_rx_signed())
         m = _signal_metrics(iq, _rx_rate())
         m["decoded"] = len(packets)
         if packets:
@@ -599,6 +607,8 @@ def select():
         _sel["rx_lna"] = max(0, min(40, int(body["rx_lna"])))
     if "rx_vga" in body:
         _sel["rx_vga"] = max(0, min(62, int(body["rx_vga"])))
+    if "rtl_gain" in body:
+        _sel["rtl_gain"] = max(0, min(50, int(body["rtl_gain"])))
     return jsonify({"ok": True, "selected": _sel})
 
 
@@ -709,7 +719,7 @@ def signal():
     finally:
         _cap_lock.release()
     p = _preset()
-    iq = dec.read_iq(RX_FILE)
+    iq = dec.read_iq(RX_FILE, signed=_rx_signed())
     return jsonify({"ok": True, "rate": p["rate"], "rx_kind": _sel["rx_kind"],
                     "metrics": _signal_metrics(iq, _rx_rate())})
 
@@ -769,7 +779,7 @@ def spectrum():
         ns = int(_rx_rate() * 0.4)
         _run_rtl(_rx_cmd(tmp, ns), timeout=5)
         import numpy as np
-        iq = dec.read_iq(tmp)
+        iq = dec.read_iq(tmp, signed=_rx_signed())
         n = min(len(iq), 2048)
         seg = iq[:n] - np.mean(iq[:n])
         w = np.abs(np.fft.fftshift(np.fft.fft(seg * np.hanning(n)))) ** 2

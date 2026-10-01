@@ -48,11 +48,22 @@ def crc16_ccitt(data: bytes) -> int:
     return crc
 
 
-def read_iq(path: str) -> np.ndarray:
-    raw = np.fromfile(path, dtype=np.int8)
+def read_iq(path: str, signed: bool = True) -> np.ndarray:
+    raw = np.fromfile(path, dtype=np.uint8)
     n = len(raw) // 2
-    i = raw[0::2].astype(np.float64) / 128.0
-    q = raw[1::2].astype(np.float64) / 128.0
+    i = raw[0::2].astype(np.float64)
+    q = raw[1::2].astype(np.float64)
+    # HackRF captures are SIGNED int8 (-128..127); RTL-SDR captures are
+    # UNSIGNED 8-bit centered on 127.5. The app passes `signed` explicitly
+    # from the selected RX device. Default to signed (legacy/HackRF).
+    if signed:
+        # HackRF: signed int8 centered on 0
+        i = np.where(i >= 128, i - 256, i) / 128.0
+        q = np.where(q >= 128, q - 256, q) / 128.0
+    else:
+        # RTL-SDR: unsigned 8-bit centered on 127.5
+        i = (i - 127.5) / 128.0
+        q = (q - 127.5) / 128.0
     return i + 1j * q
 
 
@@ -151,15 +162,21 @@ def find_bursts(iq: np.ndarray, fs: float, min_dur_ms: float = 8.0):
     return out
 
 
-def _demod_burst(iq: np.ndarray, fs: float, t0: float, t1: float, sps: int):
+def _demod_burst(iq: np.ndarray, fs: float, t0: float, t1: float, sps: int,
+                 cutoff: float = None):
     seg = iq[int(t0 * fs):int(t1 * fs)]
     seg = seg - seg.mean()
     w = np.abs(np.fft.fftshift(np.fft.fft(seg, 1 << 14))) ** 2
     f = np.fft.fftshift(np.fft.fftfreq(1 << 14, 1 / fs))
     fc = f[np.abs(w * (np.abs(f) > 4000)).argmax()]
+    if cutoff is None:
+        # scale the low-pass to the link bandwidth: deviation + data rate
+        # (Carson-ish). Keep the legacy 25 kHz floor for the narrow 9.6k PHY.
+        cutoff = max(25000.0, FREQ_DEVIATION + DATA_RATE)
+        cutoff = min(cutoff, fs / 2 * 0.9)
     t = np.arange(len(seg)) / fs
     bb = seg * np.exp(-1j * 2 * np.pi * fc * t)
-    bb = lfilter(firwin(201, 25000 / (fs / 2)), 1.0, bb)
+    bb = lfilter(firwin(201, cutoff / (fs / 2)), 1.0, bb)
     fr = np.angle(bb[1:] * np.conj(bb[:-1])) * fs / (2 * np.pi)
     fr = fr - np.median(fr)
     fr = oaconvolve(fr, gaussian_filter(0.5, sps), mode="same")
@@ -170,7 +187,7 @@ def _demod_burst(iq: np.ndarray, fs: float, t0: float, t1: float, sps: int):
 def _scan(iq: np.ndarray, fs: float, keep_bad: bool = False,
           fixed_lens=None):
     """Decode all fixed-length packets (payload_len auto-detected by CRC)."""
-    sps = int(round(fs / SST_DATA_RATE))
+    sps = int(round(fs / DATA_RATE))
     sync_bits = [(SYNC_WORD >> i) & 1 for i in range(15, -1, -1)]
     tpl = np.array([2.0 * b - 1.0 for b in sync_bits], dtype=np.float64)
     if fixed_lens is None:
@@ -227,21 +244,24 @@ def _scan(iq: np.ndarray, fs: float, keep_bad: bool = False,
 
 
 def decode(path: str, fs: float, lo_center: float = None, keep_bad: bool = False,
-           payload_len: int = None):
-    iq = read_iq(path)
+           payload_len: int = None, data_rate: float = None, signed: bool = None):
+    global DATA_RATE
+    if data_rate:
+        DATA_RATE = float(data_rate)
+    iq = read_iq(path, signed=signed)
     iq = iq - iq.mean()
     fixed_lens = [payload_len] if payload_len else None
     return _scan(iq, fs, keep_bad=keep_bad, fixed_lens=fixed_lens)
 
 
 def decode_majority(path: str, fs: float, lo_center: float = None,
-                    payload_len: int = None):
+                    payload_len: int = None, signed: bool = None):
     # Cap to a single payload length: passing None makes decode() scan all
     # 32 lengths (lengths auto-detect) which is pathologically slow on a
     # noisy capture (~40s+). Majority-vote needs only the one fixed length.
     try:
         pkts = decode(path, fs, lo_center=lo_center, keep_bad=True,
-                      payload_len=payload_len)
+                      payload_len=payload_len, signed=signed)
     except Exception:
         return []
     if not pkts:
@@ -261,10 +281,14 @@ def main():
     ap.add_argument("file")
     ap.add_argument("--fs", type=float, default=2_400_000)
     ap.add_argument("--payload-len", type=int, default=DEFAULT_PAYLOAD_LEN)
+    ap.add_argument("--rate", type=float, default=None,
+                    help="data rate in bps (default: %d)" % globals()["DATA_RATE"])
     args = ap.parse_args()
     iq = read_iq(args.file)
     iq = iq - iq.mean()
-    print(f"Reading IQ... {args.file}  ({len(iq)} samples @ {args.fs/1e3:.0f} kHz)")
+    if args.rate:
+        DATA_RATE = float(args.rate)
+    print(f"Reading IQ... {args.file}  ({len(iq)} samples @ {args.fs/1e3:.0f} kHz, {DATA_RATE:.0f} bps)")
     pkts = _scan(iq, args.fs, fixed_lens=[args.payload_len])
     print(f"{len(pkts)} unique packet(s):")
     for p in pkts:
