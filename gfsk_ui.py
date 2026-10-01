@@ -1339,7 +1339,20 @@ async function loadDevices(){
     let rxval;
     if(sel.rx_kind==='hackrf' && sel.hackrf_rx_serial){ rxval='hackrf:'+sel.hackrf_rx_serial; }
     else { rxval='rtl:'+(sel.rx_index>=0?sel.rx_index:0); }
-    if(document.querySelector('#rxsel [value="'+rxval+'"]')) rx.value=rxval;
+    if(document.querySelector('#rxsel [value="'+rxval+'"]')){ rx.value=rxval; }
+    else{
+      // stored receiver is gone — fall back to the first device actually present
+      // and tell the backend so capture uses a real receiver (display + state stay in sync)
+      const first=rx.querySelector('option[value]');
+      if(first && first.value){
+        rx.value=first.value;
+        if(first.value.startsWith('hackrf:')){
+          jpost('/select',{rx_kind:'hackrf', hackrf_rx_serial:first.value.split(':')[1]});
+        }else{
+          jpost('/select',{rx_kind:'rtl', rx_index:Number(first.value.split(':')[1])});
+        }
+      }
+    }
     updateRxGainSel(sel);
     hf.onchange=()=>jpost('/select',{hackrf_serial:hf.value||null});
     rx.onchange=(e)=>{
