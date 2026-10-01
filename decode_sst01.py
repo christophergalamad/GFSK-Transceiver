@@ -132,7 +132,13 @@ def find_bursts(iq: np.ndarray, fs: float, min_dur_ms: float = 8.0):
     win = int(fs * 0.001)
     pw = np.array([np.mean(np.abs(iq[i:i + win]) ** 2)
                    for i in range(0, len(iq) - win, win)])
-    thr = np.median(pw) * 5.0
+    # Noise-aware threshold: median is the noise floor; detect bursts well above
+    # it. A fixed median*5 misses weak-but-real bursts (measured 1.75x on a
+    # 5 m HackRF link), so scale by the robust dispersion (MAD) instead and
+    # keep a floor of ~1.6x the median for strong signals.
+    med = float(np.median(pw))
+    mad = float(np.median(np.abs(pw - med)))
+    thr = med + max(8.0 * mad, 0.6 * med)
     hi = pw > thr
     runs = []
     in_r = False
