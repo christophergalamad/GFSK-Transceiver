@@ -250,7 +250,7 @@ def _scan(iq: np.ndarray, fs: float, keep_bad: bool = False,
 
 
 def decode(path: str, fs: float, lo_center: float = None, keep_bad: bool = False,
-           payload_len: int = None, data_rate: float = None, signed: bool = None):
+           payload_len: int = None, data_rate: float = None, signed: bool = True):
     global DATA_RATE
     if data_rate:
         DATA_RATE = float(data_rate)
@@ -260,7 +260,7 @@ def decode(path: str, fs: float, lo_center: float = None, keep_bad: bool = False
     return _scan(iq, fs, keep_bad=keep_bad, fixed_lens=fixed_lens)
 
 
-def decode_auto(path: str, fs: float, signed: bool = None, max_len: int = 64):
+def decode_auto(path: str, fs: float, signed: bool = True, max_len: int = 64):
     """Receive fallback: CRC-search every fixed length 1..max_len.
 
     Used when the peer's payload length is unknown (the on-air frame carries no
@@ -274,7 +274,7 @@ def decode_auto(path: str, fs: float, signed: bool = None, max_len: int = 64):
 
 
 def decode_majority(path: str, fs: float, lo_center: float = None,
-                    payload_len: int = None, signed: bool = None):
+                    payload_len: int = None, signed: bool = True):
     # Cap to a single payload length: passing None makes decode() scan all
     # 32 lengths (lengths auto-detect) which is pathologically slow on a
     # noisy capture (~40s+). Majority-vote needs only the one fixed length.
