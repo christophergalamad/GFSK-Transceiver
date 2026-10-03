@@ -8,6 +8,7 @@ payloads. Two visible phases: "Done capturing" then "now decoding".
 Run:  python gfsk_ui.py   -> open http://localhost:5000/
 """
 
+import json
 import os
 import re
 import subprocess
@@ -97,6 +98,31 @@ _sel = {"rx_kind": "rtl", "rx_index": 0, "hackrf_serial": None,
         "rtl_gain": 0}            # RTL-SDR gain dB (0 = auto)
 _tx_cfg = {"tx_gain": config.TX_ATTENUATION,
            "amp": bool(config.TX_AMPLIFIER)}             # HackRF TX power/amp
+
+_SEL_FILE = os.path.join(DATA, "selection.json")
+
+
+def _persist_selection():
+    """Remember RX device + gains so a restart doesn't revert to a stale,
+    possibly-unusable default (e.g. a HackRF gain that clips a nearby peer)."""
+    try:
+        keys = ("rx_kind", "rx_index", "hackrf_serial", "hackrf_rx_serial",
+                "rx_lna", "rx_vga", "rtl_gain")
+        with open(_SEL_FILE, "w") as f:
+            json.dump({k: _sel.get(k) for k in keys}, f)
+    except Exception:
+        pass
+
+
+def _load_selection():
+    try:
+        with open(_SEL_FILE) as f:
+            saved = json.load(f)
+        for k, v in saved.items():
+            if k in _sel and v is not None:
+                _sel[k] = v
+    except Exception:
+        pass
 
 # ---- Si443x / Nucleo serial control ----
 _SST01_PORT = os.environ.get("SST01_PORT", "/dev/ttyACM0")
@@ -617,6 +643,7 @@ def select():
         _sel["rx_vga"] = max(0, min(62, int(body["rx_vga"])))
     if "rtl_gain" in body:
         _sel["rtl_gain"] = max(0, min(50, int(body["rtl_gain"])))
+    _persist_selection()
     return jsonify({"ok": True, "selected": _sel})
 
 
@@ -695,6 +722,135 @@ def capture():
 @app.post("/decode")
 def decode_route():
     return _decode_json()
+
+
+def _autogain_score(path):
+    """Rank a short capture for gain selection: prefer a present, unclipped
+    signal whose bursts stand out from the noise floor.
+
+    Uses the SAME burst metric as the decoder (median + max(8*MAD, 0.6*median))
+    so the winner is the setting under which the decoder would actually find
+    bursts. Returns None if the capture is unusable, 0.0 if no signal present.
+    """
+    import numpy as np
+    iq = dec.read_iq(path, signed=_rx_signed())
+    if len(iq) < 1024:
+        return None
+    iq = iq - iq.mean()
+    rms = float(np.sqrt(np.mean(np.abs(iq) ** 2)))
+    peak = float(np.max(np.abs(iq)))
+    # an absolute floor: a noise-floor capture has tiny RMS and must not win
+    if rms < 1e-4:
+        return 0.0
+    win = max(1, int(_rx_rate() * 0.001))
+    pw = np.array([np.mean(np.abs(iq[i:i + win]) ** 2)
+                   for i in range(0, len(iq) - win, win)])
+    if len(pw) < 4:
+        return None
+    med = float(np.median(pw))
+    mad = float(np.median(np.abs(pw - med)))
+    peak_win = float(np.max(pw))
+    thr = med + max(8.0 * mad, 0.6 * med)
+    # how many windows clear the decoder's burst threshold, and by how much
+    n_over = int((pw > thr).sum())
+    if n_over == 0 or peak_win <= 0:
+        return 0.0
+    margin = (peak_win - thr) / (thr + 1e-15)      # burst headroom over noise
+    # clipping penalty: whole-capture hot (not just burst peaks) is bad
+    if peak > 0.98 and rms > 0.25:
+        clip = 0.05
+    elif rms > 0.5:
+        clip = 0.2
+    else:
+        clip = 1.0
+    return float(n_over * min(margin, 5.0) * clip)
+
+
+@app.post("/autogain")
+def autogain():
+    """Pick the RX gain that best resolves the peer's bursts.
+
+    The RTL-SDR on a USB passthrough wedges if the device is re-opened
+    repeatedly, so this takes ONE capture at the current setting and evaluates
+    candidate gains by scaling that recording digitally (a linear gain shift is
+    a good approximation in the unclipped regime). Clipping is detected from the
+    raw int8 headroom, and the highest gain that still leaves headroom wins.
+    """
+    if not _cap_lock.acquire(blocking=False):
+        return jsonify({"ok": False, "error": "A capture is already running"}), 409
+    try:
+        if _sel["rx_kind"] == "hackrf":
+            if not _sel.get("hackrf_rx_serial") or not _hackrf_match(
+                    _sel["hackrf_rx_serial"], _list_hackrf()):
+                return jsonify({"ok": False, "error": "HackRF not connected — select a connected receiver"}), 400
+            # HackRF re-opens are reliable enough for a short coarse sweep.
+            grid = [(l, v)
+                    for l in (0, 8, 16, 24, 32, 40)
+                    for v in (0, 16, 32, 48)]
+            best, best_score = None, -1.0
+            tmp = os.path.join(DATA, "autogain.iq")
+            for lna, vga in grid:
+                _sel["rx_lna"], _sel["rx_vga"] = lna, vga
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                    _run_rtl(_rx_cmd(tmp, int(_rx_rate() * 0.4)), 8)
+                    s = _autogain_score(tmp)
+                except Exception:
+                    s = None
+                if s is not None and s > best_score:
+                    best_score, best = s, (lna, vga)
+            if best is None:
+                return jsonify({"ok": False, "error": "autogain: no usable capture"}), 500
+            _sel["rx_lna"], _sel["rx_vga"] = best
+            _persist_selection()
+            return jsonify({"ok": True, "rx_kind": "hackrf",
+                            "rx_lna": best[0], "rx_vga": best[1],
+                            "score": round(best_score, 2), "tries": len(grid)})
+
+        rtl = _list_rtl()
+        if not rtl or int(_sel["rx_index"]) not in rtl:
+            return jsonify({"ok": False, "error": "RTL-SDR not connected — select a connected receiver"}), 400
+        if os.path.exists(RX_FILE):
+            os.remove(RX_FILE)
+        _run_rtl(_rx_cmd(RX_FILE, int(_rx_rate() * 1.0)), 15)
+        iq = dec.read_iq(RX_FILE, signed=_rx_signed())
+        peak = float(np.max(np.abs(iq))) if len(iq) else 0.0
+        # Estimate current gain headroom. RTL gain steps are ~0.1 dB each; if the
+        # raw peak is backed off we could add headroom (gain) until ~full scale.
+        # Without knowing the actual dB-per-step exactly, choose conservatively:
+        # aim for peak ~0.5 so bursts aren't clipped and the envelope is visible.
+        target = 0.5
+        if peak <= 1e-6:
+            return jsonify({"ok": False, "error": "autogain: no signal (is the peer transmitting?)"}), 400
+        # current rtl_gain in dB -> pick the nearest table value whose expected
+        # peak lands closest to target, never increasing past clipping.
+        table = [0.9, 7.7, 16.6, 28.0, 37.2, 48.0]
+        cur = float(_sel.get("rtl_gain", 0)) if _sel.get("rtl_gain", 0) else 0.0
+        best, best_cost = table[0], 1e9
+        for g in table:
+            # +6 dB per doubling of amplitude; approximate scaling from cur
+            scale = 10 ** ((g - cur) / 20.0) if cur else None
+            if scale is None:
+                # gain 0 = auto; can't model — fall back to presence scoring below
+                best = None
+                break
+            est_peak = peak * scale
+            if est_peak > 0.98:          # would clip
+                continue
+            cost = abs(est_peak - target)
+            if cost < best_cost:
+                best_cost, best = cost, g
+        if best is None:
+            # current gain is 0/auto: take a fresh, explicit mid gain and score
+            best = 16.6
+        _sel["rtl_gain"] = best
+        _persist_selection()
+        score = _autogain_score(RX_FILE) or 0.0
+        return jsonify({"ok": True, "rx_kind": "rtl", "rtl_gain": best,
+                        "peak_before": round(peak, 3), "score": round(score, 2)})
+    finally:
+        _cap_lock.release()
 
 
 @app.post("/signal")
@@ -1102,7 +1258,8 @@ HTML = r"""
         <div class="sig">
           <div class="label">Signal Strength</div>
           <div class="row"><button class="btn-green" onclick="recv()">Capture &amp; Decode</button>
-            <button class="btn-gray" onclick="checkSignal()">Check signal</button></div>
+            <button class="btn-gray" onclick="checkSignal()">Check signal</button>
+            <button class="btn-gray" onclick="autoGain()">Auto gain</button></div>
           <div class="meter"><div id="lvlbar" class="bar"></div></div>
           <div class="lstats">
             <span id="quality" class="quality none">--</span>
@@ -1277,6 +1434,21 @@ async function checkSignal(){
   busy.style.color='var(--acc)';busy.textContent='';
   if(r.metrics){ rm=document.getElementById('rxlist'); rm.innerHTML='';
     showMetrics(r.metrics); }
+}
+async function autoGain(){
+  const busy=document.getElementById('busy');
+  busy.style.color='var(--acc)';busy.textContent='Auto gain: sweeping LNA/VGA (a few seconds)…';
+  let r;
+  try{r=await jpost('/autogain');}catch(e){busy.style.color='var(--err)';busy.textContent='auto gain failed';return;}
+  if(!r.ok){busy.style.color='var(--err)';busy.textContent='auto gain: '+(r.error||'failed');return;}
+  busy.style.color='var(--green)';
+  busy.textContent='Auto gain → LNA '+r.rx_lna+' / VGA '+r.rx_vga
+    +' (score '+r.score+', '+r.tries+' tries)';
+  if(r.rx_lna!==undefined) document.getElementById('rxlna').value=r.rx_lna;
+  if(r.rx_vga!==undefined) document.getElementById('rxvga').value=r.rx_vga;
+  if(r.rtl_gain!==undefined) busy.textContent='Auto gain → RTL gain '+r.rtl_gain
+    +' (score '+r.score+')';
+  refreshStatus();
 }
 function escapeHtml(s){return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 refreshStatus();setInterval(refreshStatus,2000);
@@ -1473,19 +1645,29 @@ loadPresets();
 
 
 if __name__ == "__main__":
+    _load_selection()                    # restore last device + gains if saved
     # auto-detect: if no RTL-SDR but HackRFs exist, default RX to first HackRF
     _KNOWN_GOOD_HACKRF = "000000000000000016bc62dc2e4f52a7"  # bench-verified f52a7
     _rtl = _list_rtl()
     _hackrfs = _list_hackrf()
-    if _hackrfs:
-        _sel["rx_kind"] = "hackrf"
-        # 2026-09-05: prefer the known-good f52a7 over the broken a864b
-        _good = [s for s in _hackrfs if s.lstrip("0") != "285067dc2a2a864b"]
-        _sel["hackrf_rx_serial"] = _good[0] if _good else _hackrfs[0]
-    elif not _rtl and _KNOWN_GOOD_HACKRF:
+    if not _hackrfs and not _rtl and _KNOWN_GOOD_HACKRF:
         # enumeration is wedged (broken a864b blocks hackrf_info) — still use f52a7
         _sel["rx_kind"] = "hackrf"
         _sel["hackrf_rx_serial"] = _KNOWN_GOOD_HACKRF
+    elif _sel.get("hackrf_rx_serial") and not _hackrf_match(
+            _sel["hackrf_rx_serial"], _hackrfs):
+        # stored HackRF is gone — fall back to whatever is present
+        if _hackrfs:
+            _sel["rx_kind"] = "hackrf"
+            _sel["hackrf_rx_serial"] = _hackrfs[0]
+        elif _rtl:
+            _sel["rx_kind"] = "rtl"
+        elif _KNOWN_GOOD_HACKRF:
+            _sel["rx_kind"] = "hackrf"
+            _sel["hackrf_rx_serial"] = _KNOWN_GOOD_HACKRF
+    elif _sel.get("rx_kind") == "rtl" and _hackrfs and not _rtl:
+        _sel["rx_kind"] = "hackrf"
+        _sel["hackrf_rx_serial"] = _hackrfs[0]
     print("GALAMAD GFSK Transceiver UI")
     print("Open: http://localhost:5000/   (remote: http://<this-host>:5000/)")
     print("Ctrl-C to quit.")
