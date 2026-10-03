@@ -442,9 +442,10 @@ def _rx_signed():
 def decode_capture(path: str) -> list:
     # Prefer strict CRC-valid packets. Try the exact payload length the app
     # is currently transmitting first (fast, correct for the self-loop), then
-    # the legacy 7-byte Si443x-class beacon format. NEVER scan all 32 lengths:
-    # that turns a ~3s decode into minutes. On a noisy bench the wideband CRC
-    # flips ~1 bit/packet, so fall back to majority-vote of the repeated
+    # the legacy 7-byte Si443x-class beacon format. If neither hits (a peer
+    # whose length we don't know — the on-air frame has no length byte), fall
+    # back to a CRC length search. On a noisy bench the wideband CRC flips
+    # ~1 bit/packet, so the final fallback is majority-vote of the repeated
     # beacon payloads, capped to a single length.
     lens = []
     if _tx.get("msg"):
@@ -463,8 +464,15 @@ def decode_capture(path: str) -> list:
                 break
     if not packets:
         try:
+            packets = dec.decode_auto(path, _rx_rate(), signed=_rx_signed(),
+                                      max_len=config.MAX_PACKET_LEN)
+        except Exception:
+            packets = []
+    if not packets:
+        try:
             packets = dec.decode_majority(
-                path, _rx_rate(), payload_len=dec.DEFAULT_PAYLOAD_LEN)
+                path, _rx_rate(), payload_len=dec.DEFAULT_PAYLOAD_LEN,
+                signed=_rx_signed())
         except Exception:
             packets = []
         best_effort = bool(packets)

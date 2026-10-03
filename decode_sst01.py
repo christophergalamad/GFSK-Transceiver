@@ -118,7 +118,7 @@ def bits_to_bytes(bits):
     for i in range(0, len(bits) - 7, 8):
         byte = 0
         for j in range(8):
-            byte = (byte << 1) | bits[i + j]
+            byte = (byte << 1) | int(bits[i + j])
         out.append(byte)
     return bytes(out)
 
@@ -258,6 +258,19 @@ def decode(path: str, fs: float, lo_center: float = None, keep_bad: bool = False
     iq = iq - iq.mean()
     fixed_lens = [payload_len] if payload_len else None
     return _scan(iq, fs, keep_bad=keep_bad, fixed_lens=fixed_lens)
+
+
+def decode_auto(path: str, fs: float, signed: bool = None, max_len: int = 64):
+    """Receive fallback: CRC-search every fixed length 1..max_len.
+
+    Used when the peer's payload length is unknown (the on-air frame carries no
+    length byte). _scan evaluates all candidate lengths in a single demod pass
+    and, when any packet repeats (n >= 2), keeps only those — which suppresses
+    the CRC false positives a wide length search would otherwise admit.
+    """
+    iq = read_iq(path, signed=signed)
+    iq = iq - iq.mean()
+    return _scan(iq, fs, fixed_lens=list(range(1, max_len + 1)))
 
 
 def decode_majority(path: str, fs: float, lo_center: float = None,
