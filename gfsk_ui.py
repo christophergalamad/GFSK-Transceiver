@@ -725,12 +725,14 @@ def decode_route():
 
 
 def _autogain_score(path):
-    """Rank a short capture for gain selection: prefer a present, unclipped
-    signal whose bursts stand out from the noise floor.
+    """Score a capture by what the DECODER can actually get out of it.
 
-    Uses the SAME burst metric as the decoder (median + max(8*MAD, 0.6*median))
-    so the winner is the setting under which the decoder would actually find
-    bursts. Returns None if the capture is unusable, 0.0 if no signal present.
+    The previous noise-ratio heuristic could reward a dead or clipped capture
+    (a small noise threshold makes the ratio explode), which is how it came to
+    pick LNA0/VGA0. Instead ask the decoder directly: how many bursts does it
+    find, and does it get CRC-valid packets? Clipping is a hard reject.
+
+    Returns (score, detail_dict) or None if unusable.
     """
     import numpy as np
     iq = dec.read_iq(path, signed=_rx_signed())
@@ -739,31 +741,32 @@ def _autogain_score(path):
     iq = iq - iq.mean()
     rms = float(np.sqrt(np.mean(np.abs(iq) ** 2)))
     peak = float(np.max(np.abs(iq)))
-    # an absolute floor: a noise-floor capture has tiny RMS and must not win
-    if rms < 1e-4:
-        return 0.0
-    win = max(1, int(_rx_rate() * 0.001))
-    pw = np.array([np.mean(np.abs(iq[i:i + win]) ** 2)
-                   for i in range(0, len(iq) - win, win)])
-    if len(pw) < 4:
-        return None
-    med = float(np.median(pw))
-    mad = float(np.median(np.abs(pw - med)))
-    peak_win = float(np.max(pw))
-    thr = med + max(8.0 * mad, 0.6 * med)
-    # how many windows clear the decoder's burst threshold, and by how much
-    n_over = int((pw > thr).sum())
-    if n_over == 0 or peak_win <= 0:
-        return 0.0
-    margin = (peak_win - thr) / (thr + 1e-15)      # burst headroom over noise
-    # clipping penalty: whole-capture hot (not just burst peaks) is bad
-    if peak > 0.98 and rms > 0.25:
-        clip = 0.05
-    elif rms > 0.5:
-        clip = 0.2
-    else:
-        clip = 1.0
-    return float(n_over * min(margin, 5.0) * clip)
+    # Hard reject a capture that is essentially clipped: the ADC is saturating,
+    # so no gain can make the envelope meaningful and bursts are destroyed.
+    rail = float(np.mean((np.abs(iq) > 0.97)))
+    if peak > 0.98 and rms > 0.3:
+        return (0.0, {"clipped": True, "rms": round(rms, 3)})
+    if rms < 1e-4:                       # dead / no signal reaching the ADC
+        return (0.0, {"dead": True, "rms": rms})
+
+    # Use the decoder's own burst finder and a strict decode pass.
+    bursts = dec.find_bursts(iq, _rx_rate())
+    n_bursts = len(bursts)
+    if n_bursts == 0:
+        return (0.0, {"bursts": 0, "rms": round(rms, 3)})
+    pkts = 0
+    try:
+        pkts = len(dec.decode_auto(path, _rx_rate(), signed=_rx_signed(),
+                                   max_len=config.MAX_PACKET_LEN))
+    except Exception:
+        pkts = 0
+    # Score: bursts prove the envelope is present; CRC-valid packets are the
+    # goal. Weight packets heavily, then burst count. Mildly favour headroom
+    # (lower peak) so we don't sit just under clipping.
+    headroom = max(0.0, 1.0 - peak)
+    score = (pkts * 100.0) + n_bursts + 2.0 * headroom
+    return (float(score), {"bursts": n_bursts, "packets": pkts,
+                           "rms": round(rms, 3), "peak": round(peak, 3)})
 
 
 @app.post("/autogain")
@@ -787,26 +790,35 @@ def autogain():
             grid = [(l, v)
                     for l in (0, 8, 16, 24, 32, 40)
                     for v in (0, 16, 32, 48)]
-            best, best_score = None, -1.0
+            best, best_score, best_detail = None, -1.0, None
+            results = []
             tmp = os.path.join(DATA, "autogain.iq")
             for lna, vga in grid:
                 _sel["rx_lna"], _sel["rx_vga"] = lna, vga
                 try:
                     if os.path.exists(tmp):
                         os.remove(tmp)
-                    _run_rtl(_rx_cmd(tmp, int(_rx_rate() * 0.4)), 8)
-                    s = _autogain_score(tmp)
+                    _run_rtl(_rx_cmd(tmp, int(_rx_rate() * 1.2)), 10)
+                    r = _autogain_score(tmp)
                 except Exception:
-                    s = None
-                if s is not None and s > best_score:
-                    best_score, best = s, (lna, vga)
-            if best is None:
-                return jsonify({"ok": False, "error": "autogain: no usable capture"}), 500
+                    r = None
+                if r is None:
+                    continue
+                s, detail = r
+                results.append({"lna": lna, "vga": vga, "score": round(s, 1),
+                                **detail})
+                if s > best_score + 1e-9:
+                    best_score, best, best_detail = s, (lna, vga), detail
+            if best is None or best_score <= 0.0:
+                return jsonify({"ok": False, "error": "autogain: no gain setting "
+                                "resolved the signal (is the peer transmitting?)",
+                                "results": results}), 400
             _sel["rx_lna"], _sel["rx_vga"] = best
             _persist_selection()
             return jsonify({"ok": True, "rx_kind": "hackrf",
                             "rx_lna": best[0], "rx_vga": best[1],
-                            "score": round(best_score, 2), "tries": len(grid)})
+                            "score": round(best_score, 2),
+                            "detail": best_detail, "tries": len(grid)})
 
         rtl = _list_rtl()
         if not rtl or int(_sel["rx_index"]) not in rtl:
@@ -846,7 +858,8 @@ def autogain():
             best = 16.6
         _sel["rtl_gain"] = best
         _persist_selection()
-        score = _autogain_score(RX_FILE) or 0.0
+        r = _autogain_score(RX_FILE)
+        score = r[0] if r else 0.0
         return jsonify({"ok": True, "rx_kind": "rtl", "rtl_gain": best,
                         "peak_before": round(peak, 3), "score": round(score, 2)})
     finally:
@@ -1323,6 +1336,14 @@ async function refreshStatus(){
     document.getElementById('txstate').textContent=on?'ON':'idle';
     document.getElementById('stopbtn').disabled=!on;
     document.getElementById('txlive').classList.toggle('show',on);
+    // keep the status line consistent with the real state (e.g. after a
+    // reload while a previous transmission is still looping). Don't clobber
+    // a transient "Configuring…"/"starting…" message from send()/sendFile().
+    const out=document.getElementById('smsgo');
+    if(!out.classList.contains('busy')){
+      if(on){ out.className='msg ok'; out.textContent='Transmitting: '+(s.message||''); }
+      else{ out.className='msg'; out.textContent='Idle — press Send / Update to transmit'; }
+    }
     if(s.freq){
       document.getElementById('txfreq').textContent=(s.freq/1e6).toFixed(3);
       document.getElementById('rxfreq').textContent=(s.rx_freq/1e6).toFixed(3);
@@ -1334,7 +1355,7 @@ async function refreshStatus(){
 }
 async function send(){
   const m=document.getElementById('msg').value.trim();
-  const out=document.getElementById('smsgo');out.className='msg';
+  const out=document.getElementById('smsgo');out.className='msg busy';
   out.textContent='Configuring transmission: '+m+'…';
   // immediately hide TX animation (old TX is about to be killed)
   document.getElementById('txlive').classList.remove('show');
@@ -1355,7 +1376,7 @@ async function sendFile(){
   const inp=document.getElementById('file');
   if(!inp.files.length){ document.getElementById('fname').textContent='No file'; return; }
   const fd=new FormData(); fd.append('file', inp.files[0]);
-  const out=document.getElementById('smsgo'); out.className='msg'; out.textContent='Uploading '+inp.files[0].name+'…';
+  const out=document.getElementById('smsgo'); out.className='msg busy'; out.textContent='Uploading '+inp.files[0].name+'…';
   document.getElementById('fname').textContent=inp.files[0].name;
   try{
     const r=await (await fetch('/sendfile',{method:'POST',body:fd})).json();
@@ -1370,8 +1391,7 @@ async function sendFile(){
 async function stopTx(){
   let r=await jpost('/stop');document.getElementById('smsgo').className='msg err';
   document.getElementById('smsgo').textContent='Transmission stopped';refreshStatus();
-}
-async function recv(){
+}async function recv(){
   const btn=document.querySelector('button[onclick="recv()"]');
   if(btn) btn.disabled=true;
   const busy=document.getElementById('busy');
