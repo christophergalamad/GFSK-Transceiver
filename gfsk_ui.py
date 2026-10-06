@@ -9,6 +9,7 @@ Run:  python gfsk_ui.py   -> open http://localhost:5000/
 """
 
 import json
+import glob
 import os
 import re
 import subprocess
@@ -125,10 +126,28 @@ def _load_selection():
         pass
 
 # ---- Si443x / Nucleo serial control ----
-_SST01_PORT = os.environ.get("SST01_PORT", "/dev/ttyACM0")
+_SST01_PORT = os.environ.get("SST01_PORT", "")   # optional override; else auto-detect
 _SST01_BAUD = 115200
+
+
+def _sst_candidates():
+    """Ports to try, in order. Nucleo re-enumerates (ACM0<->ACM1) on replug,
+    so never pin a single device path unless SST01_PORT was set explicitly."""
+    c = []
+    if _SST01_PORT:
+        c.append(_SST01_PORT)
+    c += sorted(glob.glob("/dev/ttyACM*"))
+    c += sorted(glob.glob("/dev/ttyUSB*"))
+    seen, out = set(), []
+    for p in c:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
 _ACTIVITY_AGE = 8.0            # how long a firmware-reported tx/rx stays "current"
-_sst = {"serial": None, "lock": threading.Lock(),
+_sst = {"serial": None, "port": None, "lock": threading.Lock(),
         "mode": None, "rx_line": "", "rx_msgs": [], "tx_msgs": [], "last_state": "",
         "present": False, "error": None,
         "auto": None,          # None=unknown, True=autonomous TX/RX firmware, False=command firmware
@@ -146,18 +165,22 @@ def _ts():
 def _sst_open():
     if _sst["serial"] is not None:
         return True
-    try:
-        s = serial.Serial(_SST01_PORT, _SST01_BAUD, timeout=0.2)
-        s.reset_input_buffer()
-        time.sleep(1.0)            # let Nucleo boot (POR banner)
-        s.reset_input_buffer()
-        _sst["serial"] = s
-        _sst["present"] = True
-        _sst["error"] = None
-        return True
-    except Exception as e:
-        _sst["error"] = f"cannot open {_SST01_PORT}: {e}"
-        return False
+    errs = []
+    for port in _sst_candidates():
+        try:
+            s = serial.Serial(port, _SST01_BAUD, timeout=0.2)
+            s.reset_input_buffer()
+            time.sleep(1.0)            # let Nucleo boot (POR banner)
+            s.reset_input_buffer()
+            _sst["serial"] = s
+            _sst["port"] = port
+            _sst["present"] = True
+            _sst["error"] = None
+            return True
+        except Exception as e:
+            errs.append(f"{port}: {e}")
+    _sst["error"] = "cannot open any serial port (" + "; ".join(errs) + ")"
+    return False
 
 
 def _sst_cmd(cmd, wait=0.4):
@@ -244,10 +267,23 @@ def _sst_drain(wait=0.12):
     """Consume pending serial output (no-op when idle) and update the state."""
     with _sst["lock"]:
         s = _sst["serial"]
-        if s is None or not s.in_waiting:
+        if s is None:
             return
         try:
-            buf = s.read(s.in_waiting)
+            pending = s.in_waiting
+        except Exception:
+            try:
+                s.close()
+            except Exception:
+                pass
+            _sst["serial"] = None
+            _sst["port"] = None
+            _sst["present"] = False
+            return
+        if not pending:
+            return
+        try:
+            buf = s.read(pending)
             _sst["_linebuf"] = _sst.get("_linebuf", "") + buf.decode("ascii", "replace")
             while "\n" in _sst["_linebuf"]:
                 line, _sst["_linebuf"] = _sst["_linebuf"].split("\n", 1)
@@ -256,7 +292,14 @@ def _sst_drain(wait=0.12):
                     _sst_ingest(line)
                     _sst["last_state"] = f"[{_ts()}] {line}"
         except Exception:
-            pass
+            # device vanished (unplugged) — drop the handle so _sst_open re-detects
+            try:
+                s.close()
+            except Exception:
+                pass
+            _sst["serial"] = None
+            _sst["port"] = None
+            _sst["present"] = False
 
 
 def _kill_tx():
@@ -1000,7 +1043,9 @@ def sst01_status():
     _sst_drain()
     activity = _sst["activity"] if (time.time() - _sst["activity_ts"]) <= _ACTIVITY_AGE else None
     cmd_mode = None if _sst["auto"] else _sst["mode"]   # commands don't apply to autonomous firmware
-    sst_rf_mhz = _link.get("sst_rf_mhz", 433.997)       # Si443x is quartz-locked (~433.997 MHz)
+    # Si443x frequency is set by firmware PLL registers (~434 MHz nominal →
+    # ~433.997 MHz on air due to crystal ppm); the app freq boxes do NOT tune it.
+    sst_rf_mhz = _link.get("sst_rf_mhz", 433.997)
     if not present:
         state = "offline"
     elif _sst["auto"] is True:
@@ -1025,6 +1070,7 @@ def sst01_status():
         "rx_msgs": _sst["rx_msgs"][-20:],
         "tx_msgs": _sst["tx_msgs"][-20:],
         "error": _sst["error"],
+        "port": _sst["port"],
         "sst_tx_mhz": _link["freq"] / 1e6,       # what the app TXes on (HackRF/link)
         "sst_rx_mhz": _link["rx_freq"] / 1e6,    # what the app listens on
         "sst_rf_mhz": round(_link.get("sst_rf_mhz", 433.997), 3),   # Quartz-locked chip RX/TX freq
@@ -1329,7 +1375,9 @@ HTML = r"""
       <div class="inner">
         <h2>Si443x TRANSCEIVER <span class="pill" id="sstpill" style="margin-left:8px"><span id="sstdot" class="dot off"></span><span id="sststate">connecting</span></span></h2>
         <div class="ct">Directs the Nucleo-driven Si443x-class UHF radio. The chip is a 240–930 MHz transceiver programmed via SPI registers (firmware configures ~434.000 MHz nominal; actual RF lands at ~433.997 MHz due to crystal ppm). Note: the app's frequency boxes control only the HackRF/RTL-SDR bench link, not this chip's registers.</div>
-        <div class="dev" style="max-width:380px"><span class="lbl">Radio port</span><span class="val" id="sstport">/dev/ttyACM0</span></div>
+        <div class="dev" style="max-width:380px"><span class="lbl">Radio port</span><span class="val" id="sstport">auto-detect…</span></div>
+        <div class="dev" style="max-width:100%"><span class="lbl">Si443x chip RF</span><span class="val" id="sstfreq">--</span></div>
+        <div class="dev" style="max-width:100%"><span class="lbl">Bench link (HackRF/RTL)</span><span class="val" id="sstlink">--</span></div>
         <div class="sstcols">
           <div class="sstcol">
             <h3>Si443x TX Subsection</h3>
@@ -1524,8 +1572,12 @@ async function refreshSst(){
     let label=(s.present && s.state)?s.state:((s.present)?'connected':'offline');
     st.textContent=label;
     if(pill) pill.classList.toggle('act', s.present && label!=='connected' && label!=='idle');
-    const rf=document.getElementById('sstrf');
-    if(rf) rf.textContent = 'chip '+s.sst_rf_mhz+' MHz (fixed) · link TX '+s.sst_tx_mhz+' / RX '+s.sst_rx_mhz+' MHz';
+    const rp=document.getElementById('sstport');
+    if(rp) rp.textContent = s.present ? (s.port||'auto-detect…') : 'not connected';
+    const cf=document.getElementById('sstfreq');
+    if(cf) cf.textContent = s.sst_rf_mhz+' MHz — PLL set by firmware (TX & RX same)';
+    const lk=document.getElementById('sstlink');
+    if(lk) lk.textContent = 'TX '+s.sst_tx_mhz+' / RX '+s.sst_rx_mhz+' MHz (this is NOT the chip)';
     if((s.rx_msgs&&s.rx_msgs.length)||(s.tx_msgs&&s.tx_msgs.length)){
       const log=[];
       (s.tx_msgs||[]).forEach(l=>log.push('Si443x TX: '+l));
