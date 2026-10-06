@@ -226,12 +226,14 @@ def _sst_ingest(line):
         _sst["activity"], _sst["activity_ts"] = "tx", now
     elif u.startswith("TX:") or u.startswith("SET:"):
         # alternator/raw-vary announces the payload it is transmitting
-        # ('SET:' = the sketched confirmed a new payload via the MSG: command)
+        # ('SET:' = the sketch acknowledged a MSG: payload change; we log
+        #  it via last_state only, not as a TX line, so the TX log stays clean)
         _sst["auto"] = True
         _sst["mode"] = None
         _sst["ph_tx"] = True
-        _sst["tx_msgs"].append(f"[{_ts()}] {line}")
-        _sst["tx_msgs"] = _sst["tx_msgs"][-20:]
+        if u.startswith("TX:"):
+            _sst["tx_msgs"].append(f"[{_ts()}] {line}")
+            _sst["tx_msgs"] = _sst["tx_msgs"][-20:]
         _sst["activity"], _sst["activity_ts"] = "tx", now
     elif u.startswith("TX[") or "IPKSENT" in u or "TX DONE" in u or "TIMEOUT" in u:
         # command-firmware TX echo / result report
@@ -1315,12 +1317,8 @@ HTML = r"""
       <div class="top"></div>
       <div class="inner">
         <h2>Si443x TRANSCEIVER <span class="pill" id="sstpill" style="margin-left:8px"><span id="sstdot" class="dot off"></span><span id="sststate">connecting</span></span></h2>
-        <div class="ct">Directs the Nucleo-driven Si443x-class UHF radio: RX (receive + print packet over serial) or TX (send text).</div>
+        <div class="ct">Directs the Nucleo-driven Si443x-class UHF radio. With the autonomous alternator running it TX/RX-switches on its own; set the 7-char TX payload below (reverts to GALA### after ~7&nbsp;s).</div>
         <div class="dev"><span class="lbl">Radio</span><span class="val" id="sstport">/dev/ttyACM0</span></div>
-        <div class="row" style="margin-top:14px">
-          <button class="btn-green" onclick="sstMode('rx')">RX</button>
-          <button class="btn-gold" onclick="sstMode('idle')">Idle</button>
-        </div>
         <div style="margin-top:12px">
           <label>Si443x TX message (fixed-len 7, e.g. GALA007)</label>
           <input id="sstmsg" type="text" value="GALA007" spellcheck="false" maxlength="7">
@@ -1328,7 +1326,7 @@ HTML = r"""
         <div class="row">
           <button class="btn-gold" onclick="sstSend()">Set Message + &#9650; Si443 TX</button>
         </div>
-        <div id="sstsgo" class="msg">Change the Si443x's own TX payload (auto-firmware accepted via /sst01/setmsg; also keys burst TX when command firmware is flashed).</div>
+        <div id="sstsgo" class="msg">Change the Si443x's own TX payload. Applies to the next burst(s), then the alternator resumes GALA###.</div>
         <div class="sig" style="margin-top:12px">
           <div class="label">Si443x RX / status</div>
           <pre id="sstlog" style="white-space:pre-wrap;font-size:11px;color:var(--mut);margin:0;max-height:150px;overflow:auto">(no data yet)</pre>
@@ -1517,25 +1515,17 @@ async function refreshSst(){
     }
     if(s.auto===true && go && go.textContent.indexOf('autonomous')<0 && go.className!=='msg ok' && go.className!=='msg err'){
       go.textContent=(label==='AUTO RX/TX')
-        ?'Radio is alternating TX+RX on its own — the RX/TX buttons apply only to the command firmware.'
-        :'Radio is running autonomous firmware — the RX/TX buttons apply only to the command firmware.';
+        ?'Radio is alternating TX+RX on its own — the Set Message box changes the next burst(s), then it resumes GALA###.'
+        :'Radio is running autonomous firmware — the Set Message box changes the next burst(s), then it resumes GALA###.';
     }
   }catch(e){}
-}
-async function sstMode(mode){
-  const out=document.getElementById('sstsgo'); out.className='msg';
-  out.textContent=mode==='rx'?'Switching Si443x to RX (receive packets)…':(mode==='tx'?'Switching Si443x to TX…':'Switching Si443x to idle…');
-  const r=await jpost('/sst01/mode',{mode});
-  if(r.ok){ out.className='msg ok'; out.textContent='Si443x now '+(r.mode||mode)+': '+(r.resp||''); }
-  else{ out.className='msg err'; out.textContent=r.error||'error'; }
-  refreshSst();
 }
 async function sstSend(){
   const t=document.getElementById('sstmsg').value.trim();
   const out=document.getElementById('sstsgo'); out.className='msg';
   out.textContent='Setting Si443x TX payload to '+t+'…';
   const r=await jpost('/sst01/setmsg',{text:t});
-  if(r.ok){ out.className='msg ok'; out.textContent='Si443x will TX: '+r.text+' ('+(r.resp||'ok')+')'; }
+  if(r.ok){ out.className='msg ok'; out.textContent='Si443x will TX "'+r.text+'" on the next burst(s), then resume GALA###.'; }
   else{ out.className='msg err'; out.textContent=r.error||'error'; }
   refreshSst();
 }
