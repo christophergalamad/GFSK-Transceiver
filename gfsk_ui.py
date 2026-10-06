@@ -51,7 +51,7 @@ PRESETS = {
             "digital_gain": 0.5, "tx_rate": 2_400_000},
 }
 _cur = {"name": "bench"}      # default: reliable bench decode
-_link = {"freq": 437_000_000, "rx_freq": 437_000_000}   # TX + RX carriers (Hz), independently set via the two freq boxes
+_link = {"freq": 437_000_000, "rx_freq": 437_000_000, "sst_rf_mhz": 433.997}   # TX + RX carriers (Hz), independently set via the two freq boxes; sst_rf_mhz = Si443x quartz (fixed, not tunable)
 
 
 def _preset():
@@ -1000,6 +1000,7 @@ def sst01_status():
     _sst_drain()
     activity = _sst["activity"] if (time.time() - _sst["activity_ts"]) <= _ACTIVITY_AGE else None
     cmd_mode = None if _sst["auto"] else _sst["mode"]   # commands don't apply to autonomous firmware
+    sst_rf_mhz = _link.get("sst_rf_mhz", 433.997)       # Si443x is quartz-locked (~433.997 MHz)
     if not present:
         state = "offline"
     elif _sst["auto"] is True:
@@ -1024,6 +1025,9 @@ def sst01_status():
         "rx_msgs": _sst["rx_msgs"][-20:],
         "tx_msgs": _sst["tx_msgs"][-20:],
         "error": _sst["error"],
+        "sst_tx_mhz": _link["freq"] / 1e6,       # what the app TXes on (HackRF/link)
+        "sst_rx_mhz": _link["rx_freq"] / 1e6,    # what the app listens on
+        "sst_rf_mhz": round(_link.get("sst_rf_mhz", 433.997), 3),   # Quartz-locked chip RX/TX freq
     })
 
 
@@ -1319,6 +1323,7 @@ HTML = r"""
         <h2>Si443x TRANSCEIVER <span class="pill" id="sstpill" style="margin-left:8px"><span id="sstdot" class="dot off"></span><span id="sststate">connecting</span></span></h2>
         <div class="ct">Directs the Nucleo-driven Si443x-class UHF radio. With the autonomous alternator running it TX/RX-switches on its own; set the 7-char TX payload below (reverts to GALA### after ~7&nbsp;s).</div>
         <div class="dev"><span class="lbl">Radio</span><span class="val" id="sstport">/dev/ttyACM0</span></div>
+        <div class="dev"><span class="lbl">RF freq</span><span class="val" id="sstrf">set on TX/RX boxes</span></div>
         <div style="margin-top:12px">
           <label>Si443x TX message (fixed-len 7, e.g. GALA007)</label>
           <input id="sstmsg" type="text" value="GALA007" spellcheck="false" maxlength="7">
@@ -1504,12 +1509,17 @@ async function refreshSst(){
     let label=(s.present && s.state)?s.state:((s.present)?'connected':'offline');
     st.textContent=label;
     if(pill) pill.classList.toggle('act', s.present && label!=='connected' && label!=='idle');
+    const rf=document.getElementById('sstrf');
+    if(rf) rf.textContent = 'chip '+s.sst_rf_mhz+' MHz (fixed) · link TX '+s.sst_tx_mhz+' / RX '+s.sst_rx_mhz+' MHz';
     if((s.rx_msgs&&s.rx_msgs.length)||(s.tx_msgs&&s.tx_msgs.length)){
       const log=[];
       (s.tx_msgs||[]).forEach(l=>log.push('Si443x TX: '+l));
       (s.rx_msgs||[]).forEach(l=>log.push('Si443x RX: '+l));
       log.reverse();          // newest first so the last received is on top
-      document.getElementById('sstlog').textContent=log.join('\n')+'\n'+(s.last_state?'—— '+s.last_state:'');
+      let txt=log.join('\n');
+      const hasNew=(s.last_state&&txt.indexOf(s.last_state)>=0);
+      if(s.last_state&&!hasNew) txt+='\n—— '+s.last_state;
+      document.getElementById('sstlog').textContent=txt;
     }else{
       document.getElementById('sstlog').textContent=s.last_state||(s.present?'Si443x connected':'Si443x not connected');
     }
