@@ -1344,7 +1344,7 @@ HTML = r"""
             </div>
           </div>
           <div class="sstcol">
-            <h3>Si443x RX Subsection &amp; Log</h3>
+            <h3>Si443x Transceiver Log (TX &amp; RX)</h3>
             <div class="panel">
               <div class="note">Real-time ingests from the radio's alternating TX and RX windows (newest first).</div>
               <pre id="sstlog" style="white-space:pre-wrap;font-size:11px;color:var(--mut);margin:0;max-height:165px;overflow:auto">(no data yet)</pre>
