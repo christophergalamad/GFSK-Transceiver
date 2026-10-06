@@ -224,8 +224,9 @@ def _sst_ingest(line):
         _sst["ph_tx"] = True
         _sst["rxwin_seen"] = False  # pure TX beacon, not the alternator
         _sst["activity"], _sst["activity_ts"] = "tx", now
-    elif u.startswith("TX:"):
+    elif u.startswith("TX:") or u.startswith("SET:"):
         # alternator/raw-vary announces the payload it is transmitting
+        # ('SET:' = the sketched confirmed a new payload via the MSG: command)
         _sst["auto"] = True
         _sst["mode"] = None
         _sst["ph_tx"] = True
@@ -826,6 +827,7 @@ def autogain():
         if os.path.exists(RX_FILE):
             os.remove(RX_FILE)
         _run_rtl(_rx_cmd(RX_FILE, int(_rx_rate() * 1.0)), 15)
+        import numpy as np
         iq = dec.read_iq(RX_FILE, signed=_rx_signed())
         peak = float(np.max(np.abs(iq))) if len(iq) else 0.0
         # Estimate current gain headroom. RTL gain steps are ~0.1 dB each; if the
@@ -1068,6 +1070,27 @@ def sst01_send():
     return jsonify({"ok": True, "text": text, "resp": resp})
 
 
+@app.post("/sst01/setmsg")
+def sst01_setmsg():
+    """Change what the Si443x transmits WITHOUT needing the command firmware.
+
+    Works with the autonomous alternator (sst_rxtx2): 'MSG:<text>' is a serial
+    command the sketch now honors -- the next TX bursts carry that payload.
+    The alternator's own TX radio is fixed-length 7, so cap at 7 chars.
+    """
+    data = request.get_json(force=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"ok": False, "error": "empty text"}), 400
+    if len(text) > 7:
+        return jsonify({"ok": False, "error": "alternator TX is fixed-length 7 — max 7 chars"}), 400
+    if not _sst_open():
+        return jsonify({"ok": False, "error": _sst["error"]}), 400
+    _sst_drain(0.05)
+    resp = _sst_cmd("MSG:" + text, wait=0.5)
+    return jsonify({"ok": True, "text": text, "resp": resp})
+
+
 HTML = r"""
 <!doctype html>
 <html><head><meta charset="utf-8">
@@ -1299,13 +1322,13 @@ HTML = r"""
           <button class="btn-gold" onclick="sstMode('idle')">Idle</button>
         </div>
         <div style="margin-top:12px">
-          <label>Send text on the Si443x (TX)</label>
-          <input id="sstmsg" type="text" value="HELLO FROM GALAMAD" spellcheck="false">
+          <label>Si443x TX message (fixed-len 7, e.g. GALA007)</label>
+          <input id="sstmsg" type="text" value="GALA007" spellcheck="false" maxlength="7">
         </div>
         <div class="row">
-          <button class="btn-gold" onclick="sstSend()">Send Text</button>
+          <button class="btn-gold" onclick="sstSend()">Set Message + &#9650; Si443 TX</button>
         </div>
-        <div id="sstsgo" class="msg">Si443x idle — press RX to receive, or enter text + Send.</div>
+        <div id="sstsgo" class="msg">Change the Si443x's own TX payload (auto-firmware accepted via /sst01/setmsg; also keys burst TX when command firmware is flashed).</div>
         <div class="sig" style="margin-top:12px">
           <div class="label">Si443x RX / status</div>
           <pre id="sstlog" style="white-space:pre-wrap;font-size:11px;color:var(--mut);margin:0;max-height:150px;overflow:auto">(no data yet)</pre>
@@ -1487,6 +1510,7 @@ async function refreshSst(){
       const log=[];
       (s.tx_msgs||[]).forEach(l=>log.push('Si443x TX: '+l));
       (s.rx_msgs||[]).forEach(l=>log.push('Si443x RX: '+l));
+      log.reverse();          // newest first so the last received is on top
       document.getElementById('sstlog').textContent=log.join('\n')+'\n'+(s.last_state?'—— '+s.last_state:'');
     }else{
       document.getElementById('sstlog').textContent=s.last_state||(s.present?'Si443x connected':'Si443x not connected');
@@ -1509,9 +1533,9 @@ async function sstMode(mode){
 async function sstSend(){
   const t=document.getElementById('sstmsg').value.trim();
   const out=document.getElementById('sstsgo'); out.className='msg';
-  out.textContent='Si443x TX: '+t+'…';
-  const r=await jpost('/sst01/send',{text:t});
-  if(r.ok){ out.className='msg ok'; out.textContent='Sent on the Si443x: '+r.text+' ('+(r.resp||'ok')+')'; }
+  out.textContent='Setting Si443x TX payload to '+t+'…';
+  const r=await jpost('/sst01/setmsg',{text:t});
+  if(r.ok){ out.className='msg ok'; out.textContent='Si443x will TX: '+r.text+' ('+(r.resp||'ok')+')'; }
   else{ out.className='msg err'; out.textContent=r.error||'error'; }
   refreshSst();
 }
