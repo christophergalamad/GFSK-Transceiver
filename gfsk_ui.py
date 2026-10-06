@@ -1135,6 +1135,12 @@ HTML = r"""
   .sub{color:var(--mut);font-size:12px;max-width:560px;margin:0 auto 22px;line-height:1.6}
   .grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}
   @media(max-width:760px){.grid{grid-template-columns:1fr}}
+  .card.span{grid-column:1/-1}
+  .sstcols{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:16px}
+  @media(max-width:820px){.sstcols{grid-template-columns:1fr}}
+  .sstcol h3{font-size:12px;color:var(--gold2);letter-spacing:1.5px;margin:0 0 4px;text-transform:uppercase;font-weight:800}
+  .sstcol .panel{background:var(--ink);border:1px solid var(--gold2);border-radius:12px;padding:14px 16px;margin-top:8px}
+  .sstcol .panel .note{font-size:11px;color:var(--mut);line-height:1.5;margin-bottom:10px}
   .card{background:linear-gradient(180deg,var(--card2),var(--card));
      border:2px solid var(--gold2);border-radius:18px;overflow:hidden;
      box-shadow:0 12px 30px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.05)}
@@ -1286,18 +1292,19 @@ HTML = r"""
       <div class="top"></div>
       <div class="inner">
         <h2>RECEIVE</h2>
-        <div class="ct">Captures ~<span data-s></span> s from <span id="rxkind">the receiver</span>, then demodulates + decodes</div>
-        <div class="dev"><span class="lbl">Receiving&nbsp;device</span><select id="rxsel"></select></div>
-        <div class="dev rxgain" id="rxgainrow" style="display:none">
+        <div class="ct">Captures ~<span data-s></span> s from <span id="rxkind">the receiver</span>, then demodulates + decodes. Single frequency for both sides of the link.</div>
+        <div class="dev" style="margin-top:16px"><span class="lbl">Receiving&nbsp;device</span><select id="rxsel"></select></div>
+        <div class="dev rxgain" id="rxgainrow" style="display:none;margin-top:10px">
           <span class="lbl">LNA</span><input id="rxlna" type="number" min="0" max="40" step="8">
           <span class="lbl">VGA</span><input id="rxvga" type="number" min="0" max="62" step="2">
         </div>
+        <div style="height:14px"></div>
         <div class="freqrow">
-          <label>RX frequency</label>
+          <label>RX frequency (same for TX &amp; RX)</label>
           <div class="freqbox"><input id="rxbox" type="number" min="100" max="6000" step="0.001" placeholder="437.000"><span>MHz</span></div>
           <div style="font-size:10px;color:var(--mut);margin-top:2px">listening to <b id="rxfreq">--</b> MHz &middot; RX tune <b id="rxtune">--</b> MHz (carrier lands at +100 kHz)</div>
         </div>
-        <div class="sig">
+        <div class="sig" style="margin-top:18px;padding:14px 16px">
           <div class="label">Signal Strength</div>
           <div class="row"><button class="btn-green" onclick="recv()">Capture &amp; Decode</button>
             <button class="btn-gray" onclick="checkSignal()">Check signal</button>
@@ -1309,7 +1316,7 @@ HTML = r"""
             <span id="pk">Peak: --</span>
             <span id="satflag" style="display:none">OVERLOAD</span>
           </div>
-          <div id="carrierinfo" style="font-size:11px;color:var(--mut);margin-top:4px"></div>
+          <div id="carrierinfo" style="font-size:11px;color:var(--mut);margin-top:6px"></div>
           <div id="peaks" class="pk"></div>
         </div>
         <div id="busy"></div>
@@ -1317,24 +1324,32 @@ HTML = r"""
         <ul id="rxlist"><li style="color:var(--mut)">Nothing yet</li></ul>
       </div>
     </div>
-    <div class="card">
+    <div class="card span">
       <div class="top"></div>
       <div class="inner">
         <h2>Si443x TRANSCEIVER <span class="pill" id="sstpill" style="margin-left:8px"><span id="sstdot" class="dot off"></span><span id="sststate">connecting</span></span></h2>
-        <div class="ct">Directs the Nucleo-driven Si443x-class UHF radio. With the autonomous alternator running it TX/RX-switches on its own; set the 7-char TX payload below (reverts to GALA### after ~7&nbsp;s).</div>
-        <div class="dev"><span class="lbl">Radio</span><span class="val" id="sstport">/dev/ttyACM0</span></div>
-        <div class="dev"><span class="lbl">RF freq</span><span class="val" id="sstrf">set on TX/RX boxes</span></div>
-        <div style="margin-top:12px">
-          <label>Si443x TX message (fixed-len 7, e.g. GALA007)</label>
-          <input id="sstmsg" type="text" value="GALA007" spellcheck="false" maxlength="7">
-        </div>
-        <div class="row">
-          <button class="btn-gold" onclick="sstSend()">Set Message + &#9650; Si443 TX</button>
-        </div>
-        <div id="sstsgo" class="msg">Change the Si443x's own TX payload. Applies to the next burst(s), then the alternator resumes GALA###.</div>
-        <div class="sig" style="margin-top:12px">
-          <div class="label">Si443x RX / status</div>
-          <pre id="sstlog" style="white-space:pre-wrap;font-size:11px;color:var(--mut);margin:0;max-height:150px;overflow:auto">(no data yet)</pre>
+        <div class="ct">Directs the Nucleo-driven Si443x-class UHF radio. The chip is a 240–930 MHz transceiver programmed via SPI registers (firmware configures ~434.000 MHz nominal; actual RF lands at ~433.997 MHz due to crystal ppm). Note: the app's frequency boxes control only the HackRF/RTL-SDR bench link, not this chip's registers.</div>
+        <div class="dev" style="max-width:380px"><span class="lbl">Radio port</span><span class="val" id="sstport">/dev/ttyACM0</span></div>
+        <div class="sstcols">
+          <div class="sstcol">
+            <h3>Si443x TX Subsection</h3>
+            <div class="panel">
+              <div class="note">Set the custom 7-char payload sent by the alternator on the next burst(s). Reverts to GALA### after ~7&nbsp;s.</div>
+              <label>TX message (fixed-len 7, e.g. GALA007)</label>
+              <input id="sstmsg" type="text" value="GALA007" spellcheck="false" maxlength="7">
+              <div class="row" style="margin-top:12px">
+                <button class="btn-gold" onclick="sstSend()">Set Message + &#9650; Si443 TX</button>
+              </div>
+              <div id="sstsgo" class="msg" style="margin-top:8px">Ready</div>
+            </div>
+          </div>
+          <div class="sstcol">
+            <h3>Si443x RX Subsection &amp; Log</h3>
+            <div class="panel">
+              <div class="note">Real-time ingests from the radio's alternating TX and RX windows (newest first).</div>
+              <pre id="sstlog" style="white-space:pre-wrap;font-size:11px;color:var(--mut);margin:0;max-height:165px;overflow:auto">(no data yet)</pre>
+            </div>
+          </div>
         </div>
       </div>
     </div>
