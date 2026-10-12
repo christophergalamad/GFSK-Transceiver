@@ -100,15 +100,28 @@ def to_int8_iq(iq: np.ndarray, digital_gain: float = 0.9) -> np.ndarray:
 
 
 def build_composite(packets: int, gap_ms: float, digital_gain: float = 0.9,
-                    text: str = None) -> np.ndarray:
+                    text: str = None, doppler_hz: float = 0.0,
+                    doppler_rate: float = 0.0) -> np.ndarray:
+    """Build the full looping IQ.
+
+    `doppler_hz`     : constant carrier offset (emulates a frozen Doppler shift).
+    `doppler_rate`   : Hz/s linear slew (emulates the Doppler RATE the receiver
+                       must track during a pass; the file loops so the sweep
+                       repeats). Injected as a continuous phase term
+                       exp(j*2*pi*(f_d*t + 0.5*k*t^2)) over the whole file.
+    """
     gap_samples = int(SAMPLE_RATE * gap_ms / 1000)
     segments = []
     for i in range(packets):
         payload = text.encode("ascii") if text is not None else f"{CALLSIGN} {i:04d}".encode("ascii")
-        i8 = to_int8_iq(gfsk_modulate(build_packet_bits(payload)), digital_gain)
-        segments.append(i8)
-        segments.append(np.zeros(2 * gap_samples, dtype=np.int8))
-    return np.concatenate(segments)
+        segments.append(gfsk_modulate(build_packet_bits(payload)))
+        segments.append(np.zeros(gap_samples, dtype=np.complex128))
+    comp = np.concatenate(segments)
+    if doppler_hz or doppler_rate:
+        t = np.arange(len(comp), dtype=np.float64) / SAMPLE_RATE
+        phase = 2.0 * np.pi * (doppler_hz * t + 0.5 * doppler_rate * t * t)
+        comp = comp * np.exp(1j * phase)
+    return to_int8_iq(comp, digital_gain)
 
 
 def main():
@@ -128,6 +141,10 @@ def main():
                     help="peak deviation Hz (default from config)")
     ap.add_argument("--freq", type=int, default=config.CENTER_FREQ_HZ,
                     help="carrier frequency Hz (default from config)")
+    ap.add_argument("--doppler-hz", type=float, default=0.0,
+                    help="static Doppler offset to inject into the TX IQ (Hz)")
+    ap.add_argument("--doppler-rate", type=float, default=0.0,
+                    help="Doppler rate to inject (Hz/s linear slew across the loop)")
     args = ap.parse_args()
 
     global SAMPLE_RATE, SAMPLES_PER_SYMBOL, DATA_RATE, FREQ_DEVIATION, CENTER_FREQ_HZ
@@ -137,12 +154,16 @@ def main():
     CENTER_FREQ_HZ = args.freq
     SAMPLES_PER_SYMBOL = SAMPLE_RATE / DATA_RATE
 
-    comp = build_composite(args.packets, args.gap_ms, args.digital_gain, args.text)
+    comp = build_composite(args.packets, args.gap_ms, args.digital_gain, args.text,
+                           doppler_hz=args.doppler_hz, doppler_rate=args.doppler_rate)
     comp.tofile(args.out)
+    extra = ""
+    if args.doppler_hz or args.doppler_rate:
+        extra = f", doppler +{args.doppler_hz:.0f} Hz @ {args.doppler_rate:+.0f} Hz/s"
     print(f"Wrote {args.out}: {len(comp)} bytes "
           f"({len(comp) // 2 / SAMPLE_RATE:.2f}s/loop @ {SAMPLE_RATE/1e3:.0f} kHz, "
           f"{CENTER_FREQ_HZ/1e6:.3f} MHz, {DATA_RATE/1e3:.0f} kbps, "
-          f"+/-{FREQ_DEVIATION/1e3:.0f} kHz)")
+          f"+/-{FREQ_DEVIATION/1e3:.0f} kHz{extra})")
 
 
 if __name__ == "__main__":

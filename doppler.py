@@ -212,11 +212,8 @@ class Doppler:
     def set_observer(self, lat, lon, alt):
         self.obs = (float(lat), float(lon), float(alt))
 
-    def look(self, dt: datetime, f_carrier: float = 437_000_000.0) -> dict:
-        """Topocentric geometry + Doppler at UTC instant `dt`."""
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        dt = dt.astimezone(timezone.utc)
+    def _geom(self, dt: datetime):
+        """Raw topocentric geometry at UTC instant dt -> (el, az, rho_m, range_rate)."""
         jd, fr = _jd(dt)
         e, r, v = self.sat.sgp4(jd, fr)      # km, km/s (TEME)
         if e != 0:
@@ -229,13 +226,10 @@ class Doppler:
         obs_eci = _eci_from_ecef(obs_ecef, g)
         v_obs = np.cross([0.0, 0.0, OMEGA_E], obs_eci)   # ECI observer velocity
 
-        # Range vector & range-rate (topocentric, ECI)
         rho_v = r_m - obs_eci
         rho = float(np.linalg.norm(rho_v))
-        rr_v = v_m - v_obs
-        range_rate = float(np.dot(rho_v, rr_v) / rho)     # m/s (+ = receding)
+        range_rate = float(np.dot(rho_v, v_m - v_obs) / rho)   # m/s (+ = receding)
 
-        # ENU for elevation/azimuth (do it in ECEF to avoid frame bookkeeping)
         sat_ecef = _ecef_from_eci(r_m, g)
         dr = sat_ecef - obs_ecef
         lat, lon = math.radians(self.obs[0]), math.radians(self.obs[1])
@@ -247,11 +241,22 @@ class Doppler:
         E, N, U = float(np.dot(dr, east)), float(np.dot(dr, north)), float(np.dot(dr, up))
         el = math.degrees(math.atan2(U, math.hypot(E, N)))
         az = math.degrees(math.atan2(E, N)) % 360.0
+        return el, az, rho, range_rate
+
+    def look(self, dt: datetime, f_carrier: float = 437_000_000.0, rate: bool = False) -> dict:
+        """Topocentric geometry + Doppler at UTC instant `dt`.
+
+        With `rate=True`, also returns `doppler_rate_hz_s` (the slew rate the
+        receiver must track) via a centered finite difference of range-rate.
+        """
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc)
+        el, az, rho, range_rate = self._geom(dt)
 
         dop = -range_rate / C_LIGHT * f_carrier
-        return {
+        out = {
             "t": dt,
-            "lat_sat": math.degrees(math.asin(r_m[2] / np.linalg.norm(r_m))),
             "elev_deg": el,
             "azim_deg": az,
             "range_km": rho / 1000.0,
@@ -260,6 +265,14 @@ class Doppler:
             "doppler_ppm": dop / f_carrier * 1e6 if f_carrier else 0.0,
             "visible": el > 0.0,
         }
+        if rate:
+            h = 1.0
+            rr_p = self._geom(dt + timedelta(seconds=h))[3]
+            rr_m = self._geom(dt - timedelta(seconds=h))[3]
+            rr_dot = (rr_p - rr_m) / (2 * h)                 # m/s^2
+            out["range_accel_mps2"] = rr_dot
+            out["doppler_rate_hz_s"] = -rr_dot / C_LIGHT * f_carrier
+        return out
 
     def predict_pass(self, f_carrier: float = 437_000_000.0, mask_deg: float = 5.0,
                      t0: datetime = None, horizon_min: float = 720.0,

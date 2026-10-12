@@ -349,7 +349,9 @@ def start_tx(message: str):
                 [sys.executable, GEN_PY, "--text", message, "--out", IQ_FILE,
                  "--sample-rate", str(p["tx_rate"]), "--data-rate", str(p["rate"]),
                  "--deviation", str(p["dev"]), "--freq", str(freq),
-                 "--digital-gain", str(p["digital_gain"])],
+                 "--digital-gain", str(p["digital_gain"]),
+                 "--doppler-hz", str(_dop_tx["off_hz"]),
+                 "--doppler-rate", str(_dop_tx["rate_hz_s"])],
                 check=True, stdout=subprocess.DEVNULL)
             cmd = ["hackrf_transfer"]
             dev = _sel.get("hackrf_serial") or _sel.get("hackrf_rx_serial")
@@ -632,7 +634,7 @@ def _dop_look_at(dt=None):
         return None
     dt = dt or datetime.now(timezone.utc)
     try:
-        L = m.look(dt, f)
+        L = m.look(dt, f, rate=True)
         with _dop["lock"]:
             _dop["last"], _dop["last_ts"] = L, time.time()
         return L
@@ -640,6 +642,10 @@ def _dop_look_at(dt=None):
         with _dop["lock"]:
             _dop["err"] = str(e)
         return None
+
+
+# Doppler injected into the TX IQ so the receiver sees a moving carrier in the lab
+_dop_tx = {"off_hz": 0.0, "rate_hz_s": 0.0}
 
 
 def _dop_tracker():
@@ -781,6 +787,21 @@ def doppler_track():
     return jsonify({"ok": True, "track": False})
 
 
+@app.post("/doppler/inject")
+def doppler_inject():
+    """Inject a Doppler offset/rate into the transmitted IQ (lab stress test)."""
+    b = request.get_json(silent=True) or {}
+    try:
+        off = float(b.get("off_hz", 0.0))
+        rate = float(b.get("rate_hz_s", 0.0))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "off_hz / rate_hz_s must be numbers"}), 400
+    _dop_tx["off_hz"], _dop_tx["rate_hz_s"] = off, rate
+    if _tx_running():
+        start_tx(_tx["msg"] or config.DEFAULT_MESSAGE)   # regenerate live
+    return jsonify({"ok": True, "off_hz": off, "rate_hz_s": rate, "tx_running": _tx_running()})
+
+
 @app.get("/doppler/status")
 def doppler_status():
     L = _dop_look_at()
@@ -802,6 +823,7 @@ def doppler_status():
         "sat_name": name, "source": source, "observer": obs, "downlink_hz": down, "mask_deg": mask,
         "tracking": track, "rx_freq_hz": _link["rx_freq"],
         "line1": t1, "line2": t2, "gp": gp,
+        "inject": {"off_hz": _dop_tx["off_hz"], "rate_hz_s": _dop_tx["rate_hz_s"]},
         "current": cur,
     })
 
@@ -1701,6 +1723,20 @@ HTML = r"""
               <div class="lstats" style="margin-top:10px"><span id="docur">no TLE loaded</span></div>
               <div id="dopass" style="font-size:11px;color:var(--mut);margin-top:4px"></div>
               <canvas id="dopcanvas" width="640" height="150" style="width:100%;height:150px;background:var(--ink);border:1px solid var(--gold2);border-radius:10px;margin-top:10px"></canvas>
+              <div style="margin-top:14px;border-top:1px solid var(--gold2);padding-top:12px">
+                <div class="label" style="font-size:11px;color:var(--gold2);font-weight:700;text-transform:uppercase;letter-spacing:.5px">Lab Doppler stress — inject into TX</div>
+                <div class="note" style="font-size:11px;color:var(--mut);margin:6px 0 8px">Shift/slew the transmitted carrier so the receiver faces a real moving signal. Press <b>Send</b> to radiate it.</div>
+                <div class="cfg" style="margin-top:0">
+                  <div class="freqrow"><label>Offset Hz</label><div class="freqbox"><input id="dopinjoff" type="number" step="1" value="0"></div></div>
+                  <div class="freqrow"><label>Rate Hz/s</label><div class="freqbox"><input id="dopinjrate" type="number" step="1" value="0"></div></div>
+                </div>
+                <div class="row" style="margin-top:8px">
+                  <button class="btn-gray" onclick="dopInject()">Apply to TX</button>
+                  <button class="btn-gray" onclick="dopInjectPred()">Use predicted</button>
+                  <button class="btn-gray" onclick="dopInjectClear()">Clear</button>
+                </div>
+                <div id="dopinjmsg" class="msg" style="margin-top:6px"></div>
+              </div>
             </div>
           </div>
         </div>
@@ -2016,6 +2052,21 @@ function drawDop(curHz){
       ctx.strokeStyle='#4cc47a'; ctx.lineWidth=1.5; ctx.beginPath(); ctx.moveTo(x,pad-6); ctx.lineTo(x,H-pad+14); ctx.stroke(); }
   }
 }
+function dopInjectClear(){ document.getElementById('dopinjoff').value=0; document.getElementById('dopinjrate').value=0; dopInject(); }
+async function dopInject(){
+  const g=id=>parseFloat(document.getElementById(id).value)||0;
+  const r=await jpost('/doppler/inject',{off_hz:g('dopinjoff'),rate_hz_s:g('dopinjrate')});
+  const m=document.getElementById('dopinjmsg'); m.className=r.ok?'msg ok':'msg err';
+  m.textContent=r.ok?('TX Doppler set: offset '+r.off_hz+' Hz, rate '+r.rate_hz_s+' Hz/s'
+      +((r.off_hz||r.rate_hz_s)?(r.tx_running?' — TX restarted':' — press Send'):'')):(r.error||'error');
+}
+function dopInjectPred(){
+  const c=DOP.last;
+  if(!c){ const m=document.getElementById('dopinjmsg'); m.className='msg err'; m.textContent='no live model — load a TLE first'; return; }
+  document.getElementById('dopinjoff').value=Math.round(c.doppler_hz||0);
+  document.getElementById('dopinjrate').value=Math.round(c.doppler_rate_hz_s||0);
+  dopInject();
+}
 function dopPrefill(s){
   const ta=document.getElementById('doptle');
   if(ta && (!ta.value.trim() || ta.value.indexOf('fetch or paste')>=0)){
@@ -2029,6 +2080,8 @@ function dopPrefill(s){
   }
   if(s.downlink_hz) document.getElementById('dopdown').value=(s.downlink_hz/1e6).toFixed(3);
   if(s.mask_deg!=null) document.getElementById('dopmask').value=s.mask_deg;
+  if(s.inject){ document.getElementById('dopinjoff').value=s.inject.off_hz;
+                document.getElementById('dopinjrate').value=s.inject.rate_hz_s; }
 }
 async function refreshDop(){
   try{
@@ -2049,7 +2102,9 @@ async function refreshDop(){
       el.innerHTML='<b>'+(s.sat_name||'?')+'</b>'+(s.source?(' <span style="color:var(--gold2)">['+s.source+']</span>'):'')
         +' · elev <b>'+c.elev_deg.toFixed(1)+'°</b> · az '+c.azim_deg.toFixed(0)+'° · range '+c.range_km.toFixed(0)
         +' km · rate '+c.range_rate_mps.toFixed(0)+' m/s · Doppler <b>'+(c.doppler_hz>=0?'+':'')+c.doppler_hz.toFixed(0)+' Hz</b> ('
-        +c.doppler_ppm.toFixed(1)+' ppm)'+(s.tracking?' · RX tuned '+((s.rx_freq_hz||0)/1e6).toFixed(4)+' MHz':'');
+        +c.doppler_ppm.toFixed(1)+' ppm)'
+        +(c.doppler_rate_hz_s!=null?(' · rate <b>'+(c.doppler_rate_hz_s>=0?'+':'')+c.doppler_rate_hz_s.toFixed(0)+' Hz/s</b>'):'')
+        +(s.tracking?' · RX tuned '+((s.rx_freq_hz||0)/1e6).toFixed(4)+' MHz':'');
       DOP.last=c;
     }
     else if(el){ el.textContent = ready?('→ '+(s.sat_name||'sat')+' loaded, computing…'):'no TLE loaded'; }
