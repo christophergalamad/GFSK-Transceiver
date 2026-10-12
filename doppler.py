@@ -15,12 +15,14 @@ Doppler sign convention (matches SDR practice):
 
 from __future__ import annotations
 
+import json
 import math
 import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
+from sgp4 import omm
 from sgp4.api import Satrec, jday
 
 C_LIGHT = 299_792_458.0          # m/s
@@ -30,10 +32,14 @@ WGS84_F = 1.0 / 298.257223563
 WGS84_E2 = WGS84_F * (2 - WGS84_F)
 
 CELESTRAK = "https://celestrak.org/NORAD/elements/gp.php"
+GALAMAD = "https://launchedsats.galamad.space"    # GALAMAD's own tracker (OMM/GP JSON)
 UA = {"User-Agent": "GALAMAD-GFSK/1.0 (satellite doppler; christopher.coder@galamad.space)"}
 
 GROUPS = ["stations", "amateur", "weather", "science", "cubesat",
           "galileo", "gps-ops", "oneweb", "starlink"]
+
+_GALAMAD_CACHE = {"ts": 0.0, "sats": []}
+_GALAMAD_TTL = 300.0             # seconds
 
 
 # --------------------------------------------------------------------------
@@ -82,6 +88,36 @@ def parse_tle(text: str, want: str = None):
     return entries[0]
 
 
+def fetch_galamad(catnr=None, name=None, timeout: float = 20.0):
+    """Look up an element set on the GALAMAD tracker (launchedsats.galamad.space).
+
+    Returns (name, gp_dict) where gp_dict is a CCSDS OMM / Celestrak-GP dict
+    (the same shape SGP4's `omm.initialize` consumes). Covers freshly launched
+    objects that Celestrak has not catalogued yet.
+    """
+    now = time.time()
+    if now - _GALAMAD_CACHE["ts"] > _GALAMAD_TTL or not _GALAMAD_CACHE["sats"]:
+        req = urllib.request.Request(GALAMAD + "/api/satellites", headers=UA)
+        data = json.loads(urllib.request.urlopen(req, timeout=timeout).read().decode("utf-8", "replace"))
+        _GALAMAD_CACHE["sats"] = data.get("satellites", [])
+        _GALAMAD_CACHE["ts"] = now
+    sats = _GALAMAD_CACHE["sats"]
+    if catnr is not None:
+        c = int(catnr)
+        for s in sats:
+            try:
+                if int(s.get("noradId", -1)) == c and s.get("gp"):
+                    return s.get("name") or "SAT", s["gp"]
+            except (TypeError, ValueError):
+                pass
+    if name:
+        w = str(name).strip().lower()
+        for s in sats:
+            if w and w in str(s.get("name", "")).lower() and s.get("gp"):
+                return s.get("name") or "SAT", s["gp"]
+    raise ValueError(f"GALAMAD tracker has no object for {catnr if catnr is not None else name}")
+
+
 # --------------------------------------------------------------------------
 # Time / frames
 # --------------------------------------------------------------------------
@@ -126,11 +162,21 @@ def _ecef_from_eci(vec_eci: np.ndarray, g: float) -> np.ndarray:
 # Core model
 # --------------------------------------------------------------------------
 class Doppler:
-    """SGP4 satellite + observer; computes look angles and Doppler shift."""
+    """SGP4 satellite + observer; computes look angles and Doppler shift.
 
-    def __init__(self, line1: str, line2: str, name: str = "SAT",
-                 lat=5.6037, lon=-0.1870, alt=50.0):
-        self.sat = Satrec.twoline2rv(line1, line2)
+    Accepts either a classic TLE (line1/line2) or an OMM/GP dict (`gp=`),
+    the latter being what Celestrak's JSON and the GALAMAD tracker return.
+    """
+
+    def __init__(self, line1: str = None, line2: str = None, name: str = "SAT",
+                 lat=5.6037, lon=-0.1870, alt=50.0, gp: dict = None):
+        if gp is not None:
+            self.sat = Satrec()
+            omm.initialize(self.sat, gp)
+        elif line1 and line2:
+            self.sat = Satrec.twoline2rv(line1, line2)
+        else:
+            raise ValueError("Doppler needs either a TLE (line1/line2) or a gp dict")
         self.name = name
         self.obs = (float(lat), float(lon), float(alt))
 
@@ -187,7 +233,7 @@ class Doppler:
         }
 
     def predict_pass(self, f_carrier: float = 437_000_000.0, mask_deg: float = 5.0,
-                     t0: datetime = None, horizon_min: float = 110.0,
+                     t0: datetime = None, horizon_min: float = 720.0,
                      scan_s: float = 20.0, step_s: float = 5.0) -> dict:
         """Find the next pass above `mask_deg` and return a fine Doppler curve.
 

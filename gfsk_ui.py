@@ -598,7 +598,7 @@ def _decode_json():
 # --------------------------------------------------------------------------
 _dop = {
     "lock": threading.Lock(),
-    "model": None, "sat_name": "", "tle1": "", "tle2": "",
+    "model": None, "sat_name": "", "tle1": "", "tle2": "", "gp": None, "source": "",
     "obs": {"lat": 5.6037, "lon": -0.1870, "alt": 50.0},   # default: Accra, Ghana
     "downlink_hz": 437_000_000,
     "mask_deg": 5.0,
@@ -608,16 +608,16 @@ _dop = {
 
 
 def _dop_rebuild():
-    """(Re)build the SGP4 model from the stored TLE + observer location."""
+    """(Re)build the SGP4 model from the stored element set + observer location."""
     if not _DOP_OK:
         return
     with _dop["lock"]:
-        t1, t2 = _dop["tle1"], _dop["tle2"]
+        t1, t2, gp = _dop["tle1"], _dop["tle2"], _dop["gp"]
         obs, name = dict(_dop["obs"]), _dop["sat_name"]
-    if not t1 or not t2:
+    if not (gp or (t1 and t2)):
         return
     try:
-        m = dop.Doppler(t1, t2, name, obs["lat"], obs["lon"], obs["alt"])
+        m = dop.Doppler(t1, t2, name, obs["lat"], obs["lon"], obs["alt"], gp=gp)
         with _dop["lock"]:
             _dop["model"], _dop["err"] = m, None
     except Exception as e:
@@ -665,20 +665,53 @@ def doppler_tle():
     if not _DOP_OK:
         return jsonify({"ok": False, "error": "sgp4/doppler unavailable: " + _DOP_IMPORT_ERR}), 400
     b = request.get_json(silent=True) or {}
+    src = (b.get("source") or "auto").lower()
+    name = l1 = l2 = gp = None
+    used = None
+    errs = []
+
+    def _store():
+        with _dop["lock"]:
+            _dop["sat_name"], _dop["tle1"], _dop["tle2"] = name or "SAT", l1, l2
+            _dop["gp"], _dop["source"] = gp, used
+        _dop_rebuild()
+        return jsonify({"ok": True, "name": name or "SAT", "source": used,
+                        "line1": l1, "line2": l2, "gp": gp})
+
     try:
         if b.get("text"):
-            raw = b["text"]
+            txt = b["text"].strip()
+            if txt.startswith("{"):                 # pasted OMM/GP JSON
+                gp = json.loads(txt)
+                name = gp.get("OBJECT_NAME", "SAT")
+                used = "omm"
+            else:                                    # pasted TLE
+                name, l1, l2 = dop.parse_tle(txt, want=b.get("sat"))
+                used = "tle"
         elif b.get("catnr"):
-            raw = dop.fetch_tle(catnr=int(b["catnr"]))
-        else:
-            raw = dop.fetch_tle(group=b.get("group") or "stations")
-        name, l1, l2 = dop.parse_tle(raw, want=b.get("sat"))
+            cat = int(b["catnr"])
+            if src in ("auto", "celestrak"):
+                try:
+                    name, l1, l2 = dop.parse_tle(dop.fetch_tle(catnr=cat))
+                    used = "celestrak"
+                except Exception as e:
+                    errs.append(f"celestrak: {e}")
+            if used is None and src in ("auto", "galamad"):
+                try:
+                    name, gp = dop.fetch_galamad(catnr=cat)
+                    used = "galamad"
+                except Exception as e:
+                    errs.append(f"galamad: {e}")
+        else:                                        # group (Celestrak only)
+            name, l1, l2 = dop.parse_tle(dop.fetch_tle(group=b.get("group") or "stations"),
+                                         want=b.get("sat"))
+            used = "celestrak"
     except Exception as e:
-        return jsonify({"ok": False, "error": f"TLE fetch/parse failed: {e}"}), 400
-    with _dop["lock"]:
-        _dop["sat_name"], _dop["tle1"], _dop["tle2"] = name, l1, l2
-    _dop_rebuild()
-    return jsonify({"ok": True, "name": name, "line1": l1, "line2": l2})
+        errs.append(str(e))
+
+    if used is None:
+        return jsonify({"ok": False, "error": "could not load elements — " + "; ".join(errs)}), 404
+    return _store()
 
 
 @app.post("/doppler/observer")
@@ -753,13 +786,14 @@ def doppler_status():
         name = _dop["sat_name"]
         mask = _dop["mask_deg"]
         err = _dop["err"]
+        source = _dop["source"]
     cur = None
     if L is not None:
         cur = {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in L.items()}
         cur["rx_corrected_hz"] = int(round(down + L["doppler_hz"]))
     return jsonify({
         "ok": True, "available": _DOP_OK, "error": err,
-        "sat_name": name, "observer": obs, "downlink_hz": down, "mask_deg": mask,
+        "sat_name": name, "source": source, "observer": obs, "downlink_hz": down, "mask_deg": mask,
         "tracking": track, "rx_freq_hz": _link["rx_freq"],
         "current": cur,
     })
@@ -1604,7 +1638,7 @@ HTML = r"""
       <div class="top"></div>
       <div class="inner">
         <h2>SATELLITE DOPPLER <span class="pill" id="dopill" style="margin-left:8px"><span id="dopdot" class="dot off"></span><span id="dostate">no TLE</span></span></h2>
-        <div class="ct">Fetches a real LEO TLE from Celestrak, propagates it with SGP4, and predicts the topocentric Doppler shift. <b>Track RX</b> continuously retunes the receiver to follow the downlink carrier as the satellite moves (uplink is left alone).</div>
+        <div class="ct">Fetches a real LEO TLE from Celestrak, propagates it with SGP4, and predicts the topocentric Doppler shift. Freshly launched objects that Celestrak hasn't catalogued yet are pulled automatically from the <b>GALAMAD tracker</b> (launchedsats.galamad.space) as an OMM element set. <b>Track RX</b> continuously retunes the receiver to follow the downlink carrier as the satellite moves (uplink is left alone).</div>
         <div class="sstcols">
           <div class="sstcol">
             <h3>Satellite &amp; Observer</h3>
@@ -1875,8 +1909,9 @@ async function dopFetch(){
   const cn=document.getElementById('dopcatnr').value.trim();
   const body = cn ? {catnr:cn} : {group:document.getElementById('dopgroup').value};
   const r=await jpost('/doppler/tle',body);
-  if(r.ok){ m.className='msg ok'; m.textContent='OK: '+r.name;
-    document.getElementById('doptle').value=r.name+'\n'+r.line1+'\n'+r.line2;
+  if(r.ok){ m.className='msg ok'; m.textContent='OK: '+r.name+' ('+(r.source||'?')+')';
+    document.getElementById('doptle').value = r.gp ? (r.name+'\n'+JSON.stringify(r.gp))
+        : (r.name+'\n'+r.line1+'\n'+r.line2);
   } else { m.className='msg err'; m.textContent=r.error||'error'; }
   refreshDop();
 }
@@ -1904,7 +1939,7 @@ async function dopPredict(){
   const r=await (await fetch('/doppler/predict')).json();
   if(!r.ok){ m.className='msg err'; m.textContent=r.error||'error'; return; }
   const n=r.next;
-  if(!n){ document.getElementById('dopass').textContent='No pass above the elevation mask in the next ~110 min.';
+  if(!n){ document.getElementById('dopass').textContent='No pass above '+document.getElementById('dopmask').value+'° in the next 12 h — lower the elevation mask and try again.';
     DOP.samples=[]; drawDop(); return; }
   DOP.next=n; DOP.samples=n.samples||[];
   const aos=new Date(n.aos), los=new Date(n.los), tca=n.tca?new Date(n.tca):null;
@@ -1955,7 +1990,7 @@ async function refreshDop(){
     const dot=document.getElementById('dopdot'), st=document.getElementById('dostate'), pill=document.getElementById('dopill');
     const ready=!!s.sat_name;
     dot.className='dot '+(ready?'on':'off');
-    st.textContent = ready ? (s.tracking?'TRACKING':'TLE loaded') : 'no TLE';
+    st.textContent = ready ? (s.tracking?'TRACKING':((s.source?('src: '+s.source):'loaded'))) : 'no TLE';
     if(pill) pill.classList.toggle('act', ready && s.tracking);
     DOP.tracking=!!s.tracking;
     const tb=document.getElementById('doptrackbtn');
