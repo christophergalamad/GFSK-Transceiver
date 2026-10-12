@@ -792,6 +792,7 @@ def doppler_status():
         mask = _dop["mask_deg"]
         err = _dop["err"]
         source = _dop["source"]
+        t1, t2, gp = _dop["tle1"], _dop["tle2"], _dop["gp"]
     cur = None
     if L is not None:
         cur = {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in L.items()}
@@ -800,6 +801,7 @@ def doppler_status():
         "ok": True, "available": _DOP_OK, "error": err,
         "sat_name": name, "source": source, "observer": obs, "downlink_hz": down, "mask_deg": mask,
         "tracking": track, "rx_freq_hz": _link["rx_freq"],
+        "line1": t1, "line2": t2, "gp": gp,
         "current": cur,
     })
 
@@ -1682,6 +1684,7 @@ HTML = r"""
                 <button class="btn-gold" onclick="dopGeo()">&#9679; Use my location</button>
                 <button class="btn-gray" onclick="dopStudio()">GALAMAD Studio</button>
               </div>
+              <div id="dopobsmsg" class="msg" style="margin-top:6px"></div>
             </div>
           </div>
           <div class="sstcol">
@@ -1911,14 +1914,14 @@ async function sstSend(){
 refreshSst();setInterval(refreshSst,1500);
 
 // ---- satellite doppler model ----
-let DOP={tracking:false, samples:[], last:null, next:null};
+let DOP={tracking:false, samples:[], last:null, next:null, init:false};
 function fmtDur(s){s=Math.round(s); if(s<0)return 'now'; if(s<60)return s+'s'; if(s<3600)return Math.floor(s/60)+'m '+(s%60)+'s'; return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m';}
 async function dopFetch(){
   const m=document.getElementById('dopmsg'); m.className='msg'; m.textContent='fetching…';
   const cn=document.getElementById('dopcatnr').value.trim();
   const body = cn ? {catnr:cn} : {group:document.getElementById('dopgroup').value};
   const r=await jpost('/doppler/tle',body);
-  if(r.ok){ m.className='msg ok'; m.textContent='OK: '+r.name+' ('+(r.source||'?')+')';
+  if(r.ok){ m.className='msg ok'; m.textContent='OK: '+r.name+' ('+(r.source||'?')+')'; DOP.init=true;
     document.getElementById('doptle').value = r.gp ? (r.name+'\n'+JSON.stringify(r.gp))
         : (r.name+'\n'+r.line1+'\n'+r.line2);
   } else { m.className='msg err'; m.textContent=r.error||'error'; }
@@ -1928,14 +1931,14 @@ async function dopLoadText(){
   const t=document.getElementById('doptle').value;
   const m=document.getElementById('dopmsg'); m.className='msg'; m.textContent='loading…';
   const r=await jpost('/doppler/tle',{text:t});
-  if(r.ok){ m.className='msg ok'; m.textContent='loaded: '+r.name; }
+  if(r.ok){ m.className='msg ok'; m.textContent='loaded: '+r.name; DOP.init=true; }
   else { m.className='msg err'; m.textContent=r.error||'error'; }
   refreshDop();
 }
 async function dopObs(){
   const g=id=>parseFloat(document.getElementById(id).value);
   const r=await jpost('/doppler/observer',{lat:g('doplat'),lon:g('doplon'),alt:g('dopalt')});
-  const m=document.getElementById('dopmsg'); m.className=r.ok?'msg ok':'msg err';
+  const m=document.getElementById('dopobsmsg'); m.className=r.ok?'msg ok':'msg err';
   m.textContent=r.ok?'observer set':'error';
 }
 function dopSetObs(lat,lon,alt,note){
@@ -1943,7 +1946,7 @@ function dopSetObs(lat,lon,alt,note){
   document.getElementById('doplon').value=lon.toFixed(5);
   if(alt!=null) document.getElementById('dopalt').value=Math.round(alt);
   return jpost('/doppler/observer',{lat:lat,lon:lon,alt:(alt==null?30:alt)}).then(r=>{
-    const m=document.getElementById('dopmsg'); m.className=r.ok?'msg ok':'msg err';
+    const m=document.getElementById('dopobsmsg'); m.className=r.ok?'msg ok':'msg err';
     m.textContent=r.ok?(note+' ('+lat.toFixed(4)+', '+lon.toFixed(4)+')'):'error';
   });
 }
@@ -1951,7 +1954,7 @@ function dopStudio(){
   dopSetObs(1.34413,103.88648,30,'GALAMAD Spacecraft Studio set');
 }
 function dopGeo(){
-  const m=document.getElementById('dopmsg');
+  const m=document.getElementById('dopobsmsg');
   if(!navigator.geolocation){ m.className='msg err'; m.textContent='geolocation not supported'; return; }
   m.className='msg'; m.textContent='locating… (allow the browser prompt)';
   navigator.geolocation.getCurrentPosition(
@@ -2013,12 +2016,27 @@ function drawDop(curHz){
       ctx.strokeStyle='#4cc47a'; ctx.lineWidth=1.5; ctx.beginPath(); ctx.moveTo(x,pad-6); ctx.lineTo(x,H-pad+14); ctx.stroke(); }
   }
 }
+function dopPrefill(s){
+  const ta=document.getElementById('doptle');
+  if(ta && (!ta.value.trim() || ta.value.indexOf('fetch or paste')>=0)){
+    ta.value = s.gp ? (s.sat_name+'\n'+JSON.stringify(s.gp))
+                    : (s.sat_name+'\n'+(s.line1||'')+'\n'+(s.line2||''));
+  }
+  if(s.observer){ const o=s.observer;
+    if(o.lat!=null) document.getElementById('doplat').value=(+o.lat).toFixed(5);
+    if(o.lon!=null) document.getElementById('doplon').value=(+o.lon).toFixed(5);
+    if(o.alt!=null) document.getElementById('dopalt').value=Math.round(o.alt);
+  }
+  if(s.downlink_hz) document.getElementById('dopdown').value=(s.downlink_hz/1e6).toFixed(3);
+  if(s.mask_deg!=null) document.getElementById('dopmask').value=s.mask_deg;
+}
 async function refreshDop(){
   try{
     const s=await (await fetch('/doppler/status')).json();
     if(!s.available){ document.getElementById('dostate').textContent='unavailable'; return; }
     const dot=document.getElementById('dopdot'), st=document.getElementById('dostate'), pill=document.getElementById('dopill');
     const ready=!!s.sat_name;
+    if(!DOP.init && ready){ dopPrefill(s); DOP.init=true; }
     dot.className='dot '+(ready?'on':'off');
     st.textContent = ready ? (s.tracking?'TRACKING':((s.source?('src: '+s.source):'loaded'))) : 'no TLE';
     if(pill) pill.classList.toggle('act', ready && s.tracking);
@@ -2027,11 +2045,14 @@ async function refreshDop(){
     if(tb){ tb.textContent='Track RX: '+(s.tracking?'ON':'OFF'); tb.className=s.tracking?'btn-red':'btn-green'; }
     const c=s.current;
     const el=document.getElementById('docur');
-    if(c){ el.innerHTML='elev <b>'+c.elev_deg.toFixed(1)+'°</b> · az '+c.azim_deg.toFixed(0)+'° · range '+c.range_km.toFixed(0)
+    if(c){
+      el.innerHTML='<b>'+(s.sat_name||'?')+'</b>'+(s.source?(' <span style="color:var(--gold2)">['+s.source+']</span>'):'')
+        +' · elev <b>'+c.elev_deg.toFixed(1)+'°</b> · az '+c.azim_deg.toFixed(0)+'° · range '+c.range_km.toFixed(0)
         +' km · rate '+c.range_rate_mps.toFixed(0)+' m/s · Doppler <b>'+(c.doppler_hz>=0?'+':'')+c.doppler_hz.toFixed(0)+' Hz</b> ('
         +c.doppler_ppm.toFixed(1)+' ppm)'+(s.tracking?' · RX tuned '+((s.rx_freq_hz||0)/1e6).toFixed(4)+' MHz':'');
-      DOP.last=c; }
-    else if(el){ el.textContent = ready?'—':'no TLE loaded'; }
+      DOP.last=c;
+    }
+    else if(el){ el.textContent = ready?('→ '+(s.sat_name||'sat')+' loaded, computing…'):'no TLE loaded'; }
     if(DOP.samples.length) drawDop(c?c.doppler_hz:null);
   }catch(e){}
 }
