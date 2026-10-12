@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 
 import serial
 from flask import Flask, jsonify, render_template_string, request
@@ -29,6 +30,15 @@ LOGS = os.path.join(ROOT, "logs")
 sys.path.insert(0, SRC)
 
 import decode_sst01 as dec
+
+try:
+    import doppler as dop
+    _DOP_OK = True
+    _DOP_IMPORT_ERR = ""
+except Exception as _e:                     # sgp4 not installed -> card stays usable but disabled
+    dop = None
+    _DOP_OK = False
+    _DOP_IMPORT_ERR = str(_e)
 
 CARRIER_HZ = config.CENTER_FREQ_HZ
 TX_RATE = config.TX_SAMPLE_RATE
@@ -581,6 +591,195 @@ def _decode_json():
                         "metrics": m})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# --------------------------------------------------------------------------
+# Satellite Doppler model (RX downlink tracking)
+# --------------------------------------------------------------------------
+_dop = {
+    "lock": threading.Lock(),
+    "model": None, "sat_name": "", "tle1": "", "tle2": "",
+    "obs": {"lat": 5.6037, "lon": -0.1870, "alt": 50.0},   # default: Accra, Ghana
+    "downlink_hz": 437_000_000,
+    "mask_deg": 5.0,
+    "track": False, "thread": None, "stop": False, "base_rx_hz": None,
+    "err": None, "last": None, "last_ts": 0.0,
+}
+
+
+def _dop_rebuild():
+    """(Re)build the SGP4 model from the stored TLE + observer location."""
+    if not _DOP_OK:
+        return
+    with _dop["lock"]:
+        t1, t2 = _dop["tle1"], _dop["tle2"]
+        obs, name = dict(_dop["obs"]), _dop["sat_name"]
+    if not t1 or not t2:
+        return
+    try:
+        m = dop.Doppler(t1, t2, name, obs["lat"], obs["lon"], obs["alt"])
+        with _dop["lock"]:
+            _dop["model"], _dop["err"] = m, None
+    except Exception as e:
+        with _dop["lock"]:
+            _dop["model"], _dop["err"] = None, f"TLE/SGP4 error: {e}"
+
+
+def _dop_look_at(dt=None):
+    with _dop["lock"]:
+        m, f = _dop["model"], _dop["downlink_hz"]
+    if m is None:
+        return None
+    dt = dt or datetime.now(timezone.utc)
+    try:
+        L = m.look(dt, f)
+        with _dop["lock"]:
+            _dop["last"], _dop["last_ts"] = L, time.time()
+        return L
+    except Exception as e:
+        with _dop["lock"]:
+            _dop["err"] = str(e)
+        return None
+
+
+def _dop_tracker():
+    """Background loop: retune the RX carrier to track the downlink Doppler."""
+    while True:
+        with _dop["lock"]:
+            if _dop["stop"]:
+                break
+            base = _dop["downlink_hz"]
+        L = _dop_look_at()
+        if L is not None:
+            _link["rx_freq"] = int(round(base + L["doppler_hz"]))
+        time.sleep(1.0)
+    with _dop["lock"]:
+        _dop["track"], _dop["thread"] = False, None
+        base = _dop["base_rx_hz"]
+    if base:                                   # restore the user's RX box
+        _link["rx_freq"] = int(base)
+
+
+@app.post("/doppler/tle")
+def doppler_tle():
+    if not _DOP_OK:
+        return jsonify({"ok": False, "error": "sgp4/doppler unavailable: " + _DOP_IMPORT_ERR}), 400
+    b = request.get_json(silent=True) or {}
+    try:
+        if b.get("text"):
+            raw = b["text"]
+        elif b.get("catnr"):
+            raw = dop.fetch_tle(catnr=int(b["catnr"]))
+        else:
+            raw = dop.fetch_tle(group=b.get("group") or "stations")
+        name, l1, l2 = dop.parse_tle(raw, want=b.get("sat"))
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"TLE fetch/parse failed: {e}"}), 400
+    with _dop["lock"]:
+        _dop["sat_name"], _dop["tle1"], _dop["tle2"] = name, l1, l2
+    _dop_rebuild()
+    return jsonify({"ok": True, "name": name, "line1": l1, "line2": l2})
+
+
+@app.post("/doppler/observer")
+def doppler_observer():
+    b = request.get_json(silent=True) or {}
+    try:
+        lat = float(b.get("lat")); lon = float(b.get("lon")); alt = float(b.get("alt", 0.0))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "lat/lon/alt required"}), 400
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return jsonify({"ok": False, "error": "lat/lon out of range"}), 400
+    with _dop["lock"]:
+        _dop["obs"] = {"lat": lat, "lon": lon, "alt": alt}
+    _dop_rebuild()
+    return jsonify({"ok": True, "obs": _dop["obs"]})
+
+
+@app.post("/doppler/config")
+def doppler_config():
+    b = request.get_json(silent=True) or {}
+    with _dop["lock"]:
+        if b.get("downlink_mhz") is not None:
+            try:
+                _dop["downlink_hz"] = int(float(b["downlink_mhz"]) * 1e6)
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": "bad downlink_mhz"}), 400
+        elif b.get("downlink_hz") is not None:
+            _dop["downlink_hz"] = int(b["downlink_hz"])
+        if b.get("mask_deg") is not None:
+            try:
+                _dop["mask_deg"] = float(b["mask_deg"])
+            except (TypeError, ValueError):
+                pass
+        out = {"downlink_hz": _dop["downlink_hz"], "mask_deg": _dop["mask_deg"]}
+    return jsonify({"ok": True, **out})
+
+
+@app.post("/doppler/track")
+def doppler_track():
+    b = request.get_json(silent=True) or {}
+    on = bool(b.get("on"))
+    with _dop["lock"]:
+        if on:
+            if _dop["model"] is None:
+                return jsonify({"ok": False, "error": "load a TLE first"}), 400
+            if _dop["track"]:
+                return jsonify({"ok": True, "track": True})
+            _dop["stop"] = False
+            _dop["base_rx_hz"] = _link["rx_freq"]
+            _dop["track"] = True
+            th = threading.Thread(target=_dop_tracker, daemon=True)
+            _dop["thread"] = th
+            th.start()
+            return jsonify({"ok": True, "track": True})
+        else:
+            had = _dop["track"]
+            _dop["stop"] = True
+            _dop["track"] = False
+            base = _dop["base_rx_hz"]
+        if had and base:
+            _link["rx_freq"] = int(base)
+    return jsonify({"ok": True, "track": False})
+
+
+@app.get("/doppler/status")
+def doppler_status():
+    L = _dop_look_at()
+    with _dop["lock"]:
+        track = _dop["track"]
+        obs = dict(_dop["obs"])
+        down = _dop["downlink_hz"]
+        name = _dop["sat_name"]
+        mask = _dop["mask_deg"]
+        err = _dop["err"]
+    cur = None
+    if L is not None:
+        cur = {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in L.items()}
+        cur["rx_corrected_hz"] = int(round(down + L["doppler_hz"]))
+    return jsonify({
+        "ok": True, "available": _DOP_OK, "error": err,
+        "sat_name": name, "observer": obs, "downlink_hz": down, "mask_deg": mask,
+        "tracking": track, "rx_freq_hz": _link["rx_freq"],
+        "current": cur,
+    })
+
+
+@app.get("/doppler/predict")
+def doppler_predict():
+    with _dop["lock"]:
+        m, f, mask = _dop["model"], _dop["downlink_hz"], _dop["mask_deg"]
+    if m is None:
+        return jsonify({"ok": False, "error": "load a TLE first"}), 400
+    try:
+        mask = float(request.args.get("mask", mask))
+        plan = m.predict_pass(f_carrier=f, mask_deg=mask)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    nxt = plan.get("next")
+    if nxt:
+        nxt = dict(nxt)
+    return jsonify({"ok": True, "next": nxt, "passes": plan.get("passes", [])})
 
 
 @app.get("/")
@@ -1401,6 +1600,66 @@ HTML = r"""
         </div>
       </div>
     </div>
+    <div class="card span">
+      <div class="top"></div>
+      <div class="inner">
+        <h2>SATELLITE DOPPLER <span class="pill" id="dopill" style="margin-left:8px"><span id="dopdot" class="dot off"></span><span id="dostate">no TLE</span></span></h2>
+        <div class="ct">Fetches a real LEO TLE from Celestrak, propagates it with SGP4, and predicts the topocentric Doppler shift. <b>Track RX</b> continuously retunes the receiver to follow the downlink carrier as the satellite moves (uplink is left alone).</div>
+        <div class="sstcols">
+          <div class="sstcol">
+            <h3>Satellite &amp; Observer</h3>
+            <div class="panel">
+              <div class="cfg" style="margin-top:0">
+                <div class="freqrow">
+                  <label>Celestrak group</label>
+                  <select id="dopgroup">
+                    <option value="stations">stations (ISS…)</option>
+                    <option value="amateur">amateur (AO-7…)</option>
+                    <option value="weather">weather (NOAA…)</option>
+                    <option value="cubesat">cubesat</option>
+                    <option value="science">science</option>
+                    <option value="starlink">starlink</option>
+                  </select>
+                </div>
+                <div class="freqrow" style="min-width:130px">
+                  <label>…or NORAD ID</label>
+                  <div class="freqbox"><input id="dopcatnr" type="number" min="1" placeholder="25544"></div>
+                </div>
+              </div>
+              <div class="row" style="margin-top:10px;align-items:center">
+                <button class="btn-gold" onclick="dopFetch()">Fetch TLE</button>
+                <span id="dopmsg" class="msg" style="margin:0"></span>
+              </div>
+              <label style="margin-top:12px">TLE (editable — paste 2/3 lines, then “Use pasted TLE”)</label>
+              <textarea id="doptle" spellcheck="false" style="width:100%;height:66px;box-sizing:border-box;padding:10px;border-radius:10px;border:2px solid var(--gold2);background:var(--ink);color:var(--txt);font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;resize:vertical">(fetch or paste a TLE)</textarea>
+              <div class="row" style="margin-top:8px"><button class="btn-gray" onclick="dopLoadText()">Use pasted TLE</button></div>
+              <div class="cfg" style="margin-top:16px">
+                <div class="freqrow"><label>Observer lat °N</label><div class="freqbox"><input id="doplat" type="number" step="0.0001" value="5.6037"></div></div>
+                <div class="freqrow"><label>lon °E</label><div class="freqbox"><input id="doplon" type="number" step="0.0001" value="-0.1870"></div></div>
+                <div class="freqrow" style="min-width:110px"><label>alt m</label><div class="freqbox"><input id="dopalt" type="number" step="1" value="50"></div></div>
+              </div>
+              <div class="row" style="margin-top:8px"><button class="btn-gray" onclick="dopObs()">Apply observer</button></div>
+            </div>
+          </div>
+          <div class="sstcol">
+            <h3>Pass Prediction &amp; RX Tracking</h3>
+            <div class="panel">
+              <div class="cfg" style="margin-top:0">
+                <div class="freqrow"><label>Downlink (MHz)</label><div class="freqbox"><input id="dopdown" type="number" step="0.001" value="437.000"><span>MHz</span></div></div>
+                <div class="freqrow" style="min-width:110px"><label>Min elevation °</label><div class="freqbox"><input id="dopmask" type="number" step="1" value="5"></div></div>
+              </div>
+              <div class="row" style="margin-top:10px">
+                <button class="btn-gray" onclick="dopPredict()">Predict next pass</button>
+                <button id="doptrackbtn" class="btn-green" onclick="dopTrack()">Track RX: OFF</button>
+              </div>
+              <div class="lstats" style="margin-top:10px"><span id="docur">no TLE loaded</span></div>
+              <div id="dopass" style="font-size:11px;color:var(--mut);margin-top:4px"></div>
+              <canvas id="dopcanvas" width="640" height="150" style="width:100%;height:150px;background:var(--ink);border:1px solid var(--gold2);border-radius:10px;margin-top:10px"></canvas>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
   <div class="footer">GALAMAD AEROSPACE &middot; GFSK Transceiver</div>
 </div>
@@ -1607,6 +1866,111 @@ async function sstSend(){
   refreshSst();
 }
 refreshSst();setInterval(refreshSst,1500);
+
+// ---- satellite doppler model ----
+let DOP={tracking:false, samples:[], last:null, next:null};
+function fmtDur(s){s=Math.round(s); if(s<0)return 'now'; if(s<60)return s+'s'; if(s<3600)return Math.floor(s/60)+'m '+(s%60)+'s'; return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m';}
+async function dopFetch(){
+  const m=document.getElementById('dopmsg'); m.className='msg'; m.textContent='fetching…';
+  const cn=document.getElementById('dopcatnr').value.trim();
+  const body = cn ? {catnr:cn} : {group:document.getElementById('dopgroup').value};
+  const r=await jpost('/doppler/tle',body);
+  if(r.ok){ m.className='msg ok'; m.textContent='OK: '+r.name;
+    document.getElementById('doptle').value=r.name+'\n'+r.line1+'\n'+r.line2;
+  } else { m.className='msg err'; m.textContent=r.error||'error'; }
+  refreshDop();
+}
+async function dopLoadText(){
+  const t=document.getElementById('doptle').value;
+  const m=document.getElementById('dopmsg'); m.className='msg'; m.textContent='loading…';
+  const r=await jpost('/doppler/tle',{text:t});
+  if(r.ok){ m.className='msg ok'; m.textContent='loaded: '+r.name; }
+  else { m.className='msg err'; m.textContent=r.error||'error'; }
+  refreshDop();
+}
+async function dopObs(){
+  const g=id=>parseFloat(document.getElementById(id).value);
+  const r=await jpost('/doppler/observer',{lat:g('doplat'),lon:g('doplon'),alt:g('dopalt')});
+  const m=document.getElementById('dopmsg'); m.className=r.ok?'msg ok':'msg err';
+  m.textContent=r.ok?'observer set':'error';
+}
+async function dopCfg(){
+  const g=id=>parseFloat(document.getElementById(id).value);
+  return jpost('/doppler/config',{downlink_mhz:g('dopdown'),mask_deg:g('dopmask')});
+}
+async function dopPredict(){
+  await dopCfg();
+  const m=document.getElementById('dopmsg'); m.textContent='predicting…';
+  const r=await (await fetch('/doppler/predict')).json();
+  if(!r.ok){ m.className='msg err'; m.textContent=r.error||'error'; return; }
+  const n=r.next;
+  if(!n){ document.getElementById('dopass').textContent='No pass above the elevation mask in the next ~110 min.';
+    DOP.samples=[]; drawDop(); return; }
+  DOP.next=n; DOP.samples=n.samples||[];
+  const aos=new Date(n.aos), los=new Date(n.los), tca=n.tca?new Date(n.tca):null;
+  document.getElementById('dopass').innerHTML=
+    'AOS '+aos.toISOString().substr(11,8)+'z · LOS '+los.toISOString().substr(11,8)+'z'
+    +' · dur '+fmtDur(n.duration_s)
+    +' · max elev <b>'+n.max_elev_deg.toFixed(1)+'°</b>'
+    +(tca?' · TCA '+tca.toISOString().substr(11,8)+'z':'')
+    +' · max Doppler ±<b>'+Math.abs(n.max_doppler_hz).toFixed(0)+' Hz</b> (±'+(Math.abs(n.max_doppler_hz)/437e6*1e6).toFixed(1)+' ppm)';
+  drawDop();
+}
+async function dopTrack(){
+  const want=!DOP.tracking;
+  const r=await jpost('/doppler/track',{on:want});
+  if(!r.ok){ const m=document.getElementById('dopmsg'); m.className='msg err'; m.textContent=r.error||'error'; return; }
+  DOP.tracking=r.track;
+}
+function drawDop(curHz){
+  const cv=document.getElementById('dopcanvas'); if(!cv) return;
+  const ctx=cv.getContext('2d'), W=cv.width, H=cv.height, pad=26;
+  ctx.clearRect(0,0,W,H);
+  const s=DOP.samples;
+  if(!s||s.length<2){
+    ctx.fillStyle='#8a7a66'; ctx.font='12px sans-serif';
+    ctx.fillText('no pass loaded — press “Predict next pass”',12,H/2);
+    return;
+  }
+  let mx=1e-9; for(const p of s) mx=Math.max(mx,Math.abs(p.doppler_hz));
+  const xs=i=>pad+(W-2*pad)*i/(s.length-1), ys=d=>H/2-(H/2-pad)*d/mx;
+  ctx.strokeStyle='#3a2c1c'; ctx.beginPath(); ctx.moveTo(pad,H/2); ctx.lineTo(W-pad,H/2); ctx.stroke();
+  ctx.strokeStyle='#f2b13a'; ctx.lineWidth=2; ctx.beginPath();
+  s.forEach((p,i)=>{ const x=xs(i), y=ys(p.doppler_hz); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+  ctx.stroke();
+  ctx.fillStyle='#8a7a66'; ctx.font='10px sans-serif';
+  ctx.fillText('+'+mx.toFixed(0)+' Hz',4,pad-6);
+  ctx.fillText('-'+mx.toFixed(0)+' Hz',4,H-pad+14);
+  ctx.fillText('AOS',pad-8,H-6); ctx.fillText('LOS',W-pad-16,H-6);
+  if(curHz!==undefined && curHz!==null){
+    const t0=new Date(DOP.next.aos).getTime(), t1=new Date(DOP.next.los).getTime(), now=Date.now();
+    if(now>=t0 && now<=t1){ const x=pad+(W-2*pad)*(now-t0)/(t1-t0);
+      ctx.strokeStyle='#4cc47a'; ctx.lineWidth=1.5; ctx.beginPath(); ctx.moveTo(x,pad-6); ctx.lineTo(x,H-pad+14); ctx.stroke(); }
+  }
+}
+async function refreshDop(){
+  try{
+    const s=await (await fetch('/doppler/status')).json();
+    if(!s.available){ document.getElementById('dostate').textContent='unavailable'; return; }
+    const dot=document.getElementById('dopdot'), st=document.getElementById('dostate'), pill=document.getElementById('dopill');
+    const ready=!!s.sat_name;
+    dot.className='dot '+(ready?'on':'off');
+    st.textContent = ready ? (s.tracking?'TRACKING':'TLE loaded') : 'no TLE';
+    if(pill) pill.classList.toggle('act', ready && s.tracking);
+    DOP.tracking=!!s.tracking;
+    const tb=document.getElementById('doptrackbtn');
+    if(tb){ tb.textContent='Track RX: '+(s.tracking?'ON':'OFF'); tb.className=s.tracking?'btn-red':'btn-green'; }
+    const c=s.current;
+    const el=document.getElementById('docur');
+    if(c){ el.innerHTML='elev <b>'+c.elev_deg.toFixed(1)+'°</b> · az '+c.azim_deg.toFixed(0)+'° · range '+c.range_km.toFixed(0)
+        +' km · rate '+c.range_rate_mps.toFixed(0)+' m/s · Doppler <b>'+(c.doppler_hz>=0?'+':'')+c.doppler_hz.toFixed(0)+' Hz</b> ('
+        +c.doppler_ppm.toFixed(1)+' ppm)'+(s.tracking?' · RX tuned '+((s.rx_freq_hz||0)/1e6).toFixed(4)+' MHz':'');
+      DOP.last=c; }
+    else if(el){ el.textContent = ready?'—':'no TLE loaded'; }
+    if(DOP.samples.length) drawDop(c?c.doppler_hz:null);
+  }catch(e){}
+}
+refreshDop();setInterval(refreshDop,2000);
 
 // ---- device selectors + TX power/amp ----
 async function loadDevices(){
