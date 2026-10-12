@@ -198,7 +198,7 @@ class Doppler:
     """
 
     def __init__(self, line1: str = None, line2: str = None, name: str = "SAT",
-                 lat=5.6037, lon=-0.1870, alt=50.0, gp: dict = None):
+                 lat=1.34413, lon=103.88648, alt=30.0, gp: dict = None):
         if gp is not None:
             self.sat = Satrec()
             omm.initialize(self.sat, gp)

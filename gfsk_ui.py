@@ -599,7 +599,7 @@ def _decode_json():
 _dop = {
     "lock": threading.Lock(),
     "model": None, "sat_name": "", "tle1": "", "tle2": "", "gp": None, "source": "",
-    "obs": {"lat": 5.6037, "lon": -0.1870, "alt": 50.0},   # default: Accra, Ghana
+    "obs": {"lat": 1.34413, "lon": 103.88648, "alt": 30.0},   # GALAMAD Spacecraft Studio (Singapore)
     "downlink_hz": 437_000_000,
     "mask_deg": 5.0,
     "track": False, "thread": None, "stop": False, "base_rx_hz": None,
@@ -1673,11 +1673,15 @@ HTML = r"""
               <textarea id="doptle" spellcheck="false" style="width:100%;height:66px;box-sizing:border-box;padding:10px;border-radius:10px;border:2px solid var(--gold2);background:var(--ink);color:var(--txt);font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;resize:vertical">(fetch or paste a TLE)</textarea>
               <div class="row" style="margin-top:8px"><button class="btn-gray" onclick="dopLoadText()">Use pasted TLE</button></div>
               <div class="cfg" style="margin-top:16px">
-                <div class="freqrow"><label>Observer lat °N</label><div class="freqbox"><input id="doplat" type="number" step="0.0001" value="5.6037"></div></div>
-                <div class="freqrow"><label>lon °E</label><div class="freqbox"><input id="doplon" type="number" step="0.0001" value="-0.1870"></div></div>
-                <div class="freqrow" style="min-width:110px"><label>alt m</label><div class="freqbox"><input id="dopalt" type="number" step="1" value="50"></div></div>
+                <div class="freqrow"><label>Observer lat °N</label><div class="freqbox"><input id="doplat" type="number" step="0.00001" value="1.34413"></div></div>
+                <div class="freqrow"><label>lon °E</label><div class="freqbox"><input id="doplon" type="number" step="0.00001" value="103.88648"></div></div>
+                <div class="freqrow" style="min-width:110px"><label>alt m</label><div class="freqbox"><input id="dopalt" type="number" step="1" value="30"></div></div>
               </div>
-              <div class="row" style="margin-top:8px"><button class="btn-gray" onclick="dopObs()">Apply observer</button></div>
+              <div class="row" style="margin-top:8px">
+                <button class="btn-gray" onclick="dopObs()">Apply observer</button>
+                <button class="btn-gold" onclick="dopGeo()">&#9679; Use my location</button>
+                <button class="btn-gray" onclick="dopStudio()">GALAMAD Studio</button>
+              </div>
             </div>
           </div>
           <div class="sstcol">
@@ -1933,6 +1937,27 @@ async function dopObs(){
   const r=await jpost('/doppler/observer',{lat:g('doplat'),lon:g('doplon'),alt:g('dopalt')});
   const m=document.getElementById('dopmsg'); m.className=r.ok?'msg ok':'msg err';
   m.textContent=r.ok?'observer set':'error';
+}
+function dopSetObs(lat,lon,alt,note){
+  document.getElementById('doplat').value=lat.toFixed(5);
+  document.getElementById('doplon').value=lon.toFixed(5);
+  if(alt!=null) document.getElementById('dopalt').value=Math.round(alt);
+  return jpost('/doppler/observer',{lat:lat,lon:lon,alt:(alt==null?30:alt)}).then(r=>{
+    const m=document.getElementById('dopmsg'); m.className=r.ok?'msg ok':'msg err';
+    m.textContent=r.ok?(note+' ('+lat.toFixed(4)+', '+lon.toFixed(4)+')'):'error';
+  });
+}
+function dopStudio(){
+  dopSetObs(1.34413,103.88648,30,'GALAMAD Spacecraft Studio set');
+}
+function dopGeo(){
+  const m=document.getElementById('dopmsg');
+  if(!navigator.geolocation){ m.className='msg err'; m.textContent='geolocation not supported'; return; }
+  m.className='msg'; m.textContent='locating… (allow the browser prompt)';
+  navigator.geolocation.getCurrentPosition(
+    pos=>dopSetObs(pos.coords.latitude,pos.coords.longitude,pos.coords.altitude,'browser location set'),
+    err=>{ m.className='msg err'; m.textContent='geolocation failed: '+err.message+' (needs https or localhost, and permission)'; },
+    {enableHighAccuracy:true, timeout:9000, maximumAge:60000});
 }
 async function dopCfg(){
   const g=id=>parseFloat(document.getElementById(id).value);
