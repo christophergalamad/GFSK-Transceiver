@@ -692,8 +692,9 @@ def doppler_tle():
             cat = int(b["catnr"])
             if src in ("auto", "celestrak"):
                 try:
-                    name, l1, l2 = dop.parse_tle(dop.fetch_tle(catnr=cat))
-                    used = "celestrak"
+                    gp = dop.fetch_gp(catnr=cat)[0]
+                    name = gp.get("OBJECT_NAME", "SAT")
+                    used = "celestrak"               # OMM/JSON (works for >99999)
                 except Exception as e:
                     errs.append(f"celestrak: {e}")
             if used is None and src in ("auto", "galamad"):
@@ -702,9 +703,13 @@ def doppler_tle():
                     used = "galamad"
                 except Exception as e:
                     errs.append(f"galamad: {e}")
-        else:                                        # group (Celestrak only)
-            name, l1, l2 = dop.parse_tle(dop.fetch_tle(group=b.get("group") or "stations"),
-                                         want=b.get("sat"))
+        else:                                        # group (Celestrak)
+            gps = dop.fetch_gp(group=b.get("group") or "stations")
+            if b.get("sat"):
+                w = b["sat"].strip().lower()
+                gps = [g for g in gps if w in g.get("OBJECT_NAME", "").lower()] or gps
+            gp = gps[0]
+            name = gp.get("OBJECT_NAME", "SAT")
             used = "celestrak"
     except Exception as e:
         errs.append(str(e))
@@ -1638,7 +1643,7 @@ HTML = r"""
       <div class="top"></div>
       <div class="inner">
         <h2>SATELLITE DOPPLER <span class="pill" id="dopill" style="margin-left:8px"><span id="dopdot" class="dot off"></span><span id="dostate">no TLE</span></span></h2>
-        <div class="ct">Fetches a real LEO TLE from Celestrak, propagates it with SGP4, and predicts the topocentric Doppler shift. Freshly launched objects that Celestrak hasn't catalogued yet are pulled automatically from the <b>GALAMAD tracker</b> (launchedsats.galamad.space) as an OMM element set. <b>Track RX</b> continuously retunes the receiver to follow the downlink carrier as the satellite moves (uplink is left alone).</div>
+        <div class="ct">Fetches a real element set from Celestrak (OMM/JSON, so it also works for new 6-digit NORAD IDs like 100796), propagates it with SGP4, and predicts the topocentric Doppler shift. If Celestrak has no elements, it falls back to the <b>GALAMAD tracker</b> (launchedsats.galamad.space). <b>Track RX</b> continuously retunes the receiver to follow the downlink carrier as the satellite moves (uplink is left alone).</div>
         <div class="sstcols">
           <div class="sstcol">
             <h3>Satellite &amp; Observer</h3>

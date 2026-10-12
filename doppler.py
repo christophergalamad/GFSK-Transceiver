@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import math
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -46,7 +47,12 @@ _GALAMAD_TTL = 300.0             # seconds
 # TLE fetch / parse
 # --------------------------------------------------------------------------
 def fetch_tle(group: str = None, catnr: int = None, timeout: float = 15.0) -> str:
-    """Return raw TLE text from Celestrak (by group or by NORAD catalog number)."""
+    """Return raw TLE text from Celestrak (by group or by NORAD catalog number).
+
+    NOTE: Celestrak has retired the classic TLE format for catalog numbers
+    > 99999 (the alpha-5 scheme is deprecated), so this 404s for those objects.
+    Prefer `fetch_gp()` (OMM/JSON), which works for all catalog numbers.
+    """
     if catnr:
         url = f"{CELESTRAK}?CATNR={int(catnr)}&FORMAT=TLE"
     else:
@@ -57,6 +63,29 @@ def fetch_tle(group: str = None, catnr: int = None, timeout: float = 15.0) -> st
     if not txt or "No GP data found" in txt or txt.startswith("No TLE"):
         raise ValueError("Celestrak returned no TLE")
     return txt
+
+
+def fetch_gp(catnr=None, group: str = None, name: str = None, timeout: float = 15.0) -> list:
+    """Fetch OMM/GP element set(s) from Celestrak as JSON.
+
+    Works for 5- and 6-digit catalog numbers (unlike the TLE format). Returns a
+    list of gp dicts (CCSDS OMM), each consumable by `Doppler(gp=...)`.
+    """
+    if catnr:
+        q = "CATNR=" + str(int(catnr))
+    elif name:
+        q = "NAME=" + urllib.parse.quote(name)
+    else:
+        q = "GROUP=" + urllib.parse.quote(group or "stations")
+    url = f"{CELESTRAK}?{q}&FORMAT=JSON"
+    req = urllib.request.Request(url, headers=UA)
+    txt = urllib.request.urlopen(req, timeout=timeout).read().decode("utf-8", "replace").strip()
+    if not txt or "No GP data" in txt:
+        raise ValueError("Celestrak returned no GP data")
+    data = json.loads(txt)
+    if not isinstance(data, list) or not data:
+        raise ValueError("Celestrak returned no GP data")
+    return data
 
 
 def parse_tle(text: str, want: str = None):
@@ -339,9 +368,9 @@ def _refine(model: Doppler, lo: datetime, hi: datetime, f_carrier: float,
 if __name__ == "__main__":
     import sys
     arg = sys.argv[1] if len(sys.argv) > 1 else "stations"
-    raw = fetch_tle(catnr=int(arg)) if arg.isdigit() else fetch_tle(group=arg)
-    name, l1, l2 = parse_tle(raw)
-    d = Doppler(l1, l2, name)          # default observer: Accra, Ghana
+    gp = (fetch_gp(catnr=int(arg)) if arg.isdigit() else fetch_gp(group=arg))[0]
+    name = gp.get("OBJECT_NAME", "SAT")
+    d = Doppler(gp=gp, name=name)      # default observer: Accra, Ghana
     L = d.look(datetime.now(timezone.utc))
     print(f"{name}: el={L['elev_deg']:.1f} az={L['azim_deg']:.1f} "
           f"range={L['range_km']:.1f} km rr={L['range_rate_mps']:.1f} m/s "
